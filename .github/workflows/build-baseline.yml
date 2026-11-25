@@ -347,6 +347,71 @@ jobs:
           xml = xml.replace('android:text="cancel"', 'android:text="Pause"').replace('android:text="retry"', 'android:text="Retry"')
           layout.write_text(xml)
           PY
+      - name: Apply Tovarish AMOLED dark theme
+        working-directory: upstream/geniex_chat_android
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          import re
+          import xml.etree.ElementTree as ET
+          root = Path('src/main')
+          res = root / 'res'
+          def edit(p, old, new):
+              s = p.read_text()
+              assert old in s, f'Missing anchor: {p}: {old}'
+              p.write_text(s.replace(old, new))
+          colors = res / 'values/colors.xml'
+          edit(colors, '<color name="bg_normal">#F6F7F9</color>', '<color name="bg_normal">#000000</color>')
+          edit(colors, '<color name="font_black">#1F1F1F</color>', '<color name="font_black">#F2F2F3</color>')
+          edit(colors, '</resources>', '''    <color name="tovarish_surface">#151518</color>
+              <color name="tovarish_accent">#8AB4FF</color>
+              <color name="tovarish_secondary">#B8B8C0</color>
+          </resources>''')
+          theme = res / 'values/themes.xml'
+          edit(theme, '</resources>', '''    <style name="Theme.Tovarish" parent="Theme.MaterialComponents.NoActionBar">
+                  <item name="android:windowBackground">@color/bg_normal</item>
+                  <item name="android:colorBackground">@color/bg_normal</item>
+                  <item name="colorSurface">@color/tovarish_surface</item>
+                  <item name="colorOnSurface">@color/font_black</item>
+                  <item name="colorPrimary">@color/tovarish_accent</item>
+                  <item name="colorPrimaryVariant">@color/tovarish_accent</item>
+                  <item name="colorOnPrimary">@color/black</item>
+                  <item name="colorSecondary">@color/tovarish_accent</item>
+                  <item name="colorOnSecondary">@color/black</item>
+                  <item name="android:textColorPrimary">@color/font_black</item>
+                  <item name="android:textColorSecondary">@color/tovarish_secondary</item>
+                  <item name="android:textColorLink">@color/tovarish_accent</item>
+                  <item name="android:statusBarColor">@color/black</item>
+                  <item name="android:navigationBarColor">@color/black</item>
+                  <item name="android:windowLightStatusBar">false</item>
+                  <item name="android:windowLightNavigationBar">false</item>
+                  <item name="android:forceDarkAllowed">false</item>
+              </style>
+          </resources>''')
+          edit(root / 'AndroidManifest.xml', '@style/Theme.MaterialComponents.Light.NoActionBar', '@style/Theme.Tovarish')
+          edit(theme, 'Theme.Design.Light.BottomSheetDialog', 'Theme.Design.BottomSheetDialog')
+          for name in ('MainActivity.kt', 'activity/FileContentActivity.kt'):
+              p = root / 'java/com/geniex/demo' / name
+              edit(p, 'statusBarColorInt(Color.WHITE)', 'statusBarColorInt(Color.BLACK)')
+              edit(p, 'statusBarDarkFont(true)', 'statusBarDarkFont(false)')
+          # Recolor layout UI attributes, without changing image assets or launcher art.
+          palette = {'#1F1F1F':'#F2F2F3', '#888888':'#B8B8C0', '#ADADAD':'#A6A6AF', '#E7E7E7':'#303036', '#FFFFFF':'#151518', '#FFFFFFFF':'#FF151518', '#F6F7F9':'#000000'}
+          for p in res.glob('layout*/*.xml'):
+              def recolor(m):
+                  attr, value = m.groups()
+                  if value == '@color/white' and attr == 'background':
+                      value = '@color/tovarish_surface'
+                  elif value.upper() in palette:
+                      value = palette[value.upper()]
+                  return 'android:'+attr+'="'+value+'"'
+              p.write_text(re.sub(r'android:(textColor|textColorHint|background)="([^"]+)"', recolor, p.read_text()))
+          edit(res/'drawable/btn_rounded_border.xml', '#FFFFFFFF', '#FF151518')
+          edit(res/'drawable/bg_input_box_background.xml', '#ffffff', '#151518')
+          edit(res/'drawable/bg_user_message.xml', '#DBEAEB', '#202D40')
+          # Basic resource validation before invoking Android's resource compiler.
+          for p in [colors, theme, root/'AndroidManifest.xml', *res.glob('layout*/*.xml')]:
+              ET.parse(p)
+          PY
       - name: Build debug APK
         working-directory: upstream/geniex_chat_android
         run: gradle --no-daemon testDebugUnitTest assembleDebug
