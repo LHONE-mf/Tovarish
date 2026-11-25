@@ -2,12 +2,13 @@ name: Build Tovarish baseline APK
 on:
   pull_request:
   workflow_dispatch:
-  push:
-    branches: [main, build/geniex-baseline]
 permissions:
   contents: read
 jobs:
   build:
+    if: github.event_name == 'workflow_dispatch' || (github.event.pull_request.head.repo.full_name == github.repository && github.head_ref == 'build/geniex-baseline')
+    permissions:
+      contents: write
     runs-on: ubuntu-latest
     timeout-minutes: 25
     steps:
@@ -54,8 +55,31 @@ jobs:
           "$ANDROID_HOME/build-tools/34.0.0/apksigner" verify --verbose out/Tovarish-debug.apk
           (cd out && sha256sum Tovarish-debug.apk > SHA256SUMS.txt)
       - uses: actions/upload-artifact@v4
+        id: artifact
+        continue-on-error: true
         with:
           name: Tovarish-baseline-debug
           path: out/
           if-no-files-found: error
-          retention-days: 14
+          retention-days: 7
+          compression-level: 0
+      - name: Save private draft release if artifact upload fails
+        if: steps.artifact.outcome == 'failure'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          set -euo pipefail
+          test "$(gh api "repos/$GITHUB_REPOSITORY" --jq .private)" = true
+          tag="baseline-test-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          gh release create "$tag" out/* --repo "$GITHUB_REPOSITORY" --draft --target "$HEAD_SHA" --title "Tovarish private baseline test" --notes "Unpublished test build. APK signature verified; see SHA256SUMS.txt. No device validation yet."
+          gh release view "$tag" --repo "$GITHUB_REPOSITORY" --json isDraft,assets,url > /tmp/tovarish-release.json
+          python - <<'PY'
+          import json
+          from pathlib import Path
+          r = json.loads(Path('/tmp/tovarish-release.json').read_text())
+          assert r['isDraft'], 'Expected an unpublished draft'
+          assert {p.name for p in Path('out').iterdir()} <= {a['name'] for a in r['assets']}
+          print(r['url'])
+          PY
+          echo "Private draft download: $(gh release view "$tag" --repo "$GITHUB_REPOSITORY" --json url --jq .url)" >> "$GITHUB_STEP_SUMMARY"
