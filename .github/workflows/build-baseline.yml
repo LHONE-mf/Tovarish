@@ -461,10 +461,6 @@ jobs:
                           .show()
                   }
               }''')
-          replace('''        modelScope.launch {
-                      resetLoadState()
-                      val paths = ModelManagerWrapper.getPaths(selectModelData.modelName)'''.replace('\n          ', '\n'), '''        modelScope.launch {
-                      resetLoadState()
           replace('            val pluginId = paths.runtime_id.ifEmpty { modelDataPluginId }', '''            val pluginId = paths.runtime_id.ifEmpty { modelDataPluginId }
                       val isNativeNpu = pluginId == "qairt" || selectModelData.runtime == "qairt"
                       val loadPrefs = getSharedPreferences("native_load", MODE_PRIVATE)
@@ -492,12 +488,8 @@ jobs:
                               return@launch
                           }
                       }''')
-          replace('''                        .onSuccess { wrapper ->
-                                      isLoadLlmModel = true'''.replace('\n          ', '\n'), '''                        .onSuccess { wrapper ->
-                                      if (isNativeNpu) loadPrefs.edit().remove("pending_id").remove("pending").commit()
           replace('                            isLoadLlmModel = true', '''                            if (isNativeNpu) loadPrefs.edit().remove("pending_id").remove("pending").commit()
                                       isLoadLlmModel = true''')
-          replace('''                            onLoadModelFailed(error.message.toString())''', '''                            if (isNativeNpu) loadPrefs.edit().remove("pending_id").remove("pending").commit()
           old = '                            onLoadModelFailed(error.message.toString())'
           assert s.count(old) == 2
           s = s.replace(old, '                            if (isNativeNpu) loadPrefs.edit().remove("pending_id").remove("pending").commit()\n'+old)
