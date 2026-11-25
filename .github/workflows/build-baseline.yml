@@ -94,24 +94,149 @@ jobs:
                       if (wakeLock.isHeld) wakeLock.release()''')
           p.write_text(s)
           PY
+      - name: Add download diagnostics to isolated test app
+        working-directory: upstream/geniex_chat_android
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          def replace(p, old, new):
+              s = p.read_text()
+              assert s.count(old) == 1, f'Unexpected upstream source: {p}'
+              p.write_text(s.replace(old, new))
+          p = Path('src/main/java/com/geniex/demo/MainActivity.kt')
+          replace(p, '        tvDownloadProgress.text = "0%"\n\n        val hub =', '''        tvDownloadProgress.text = "Connecting to model server…"
+                  pbDownloading.isIndeterminate = true
+                  val meter = DownloadMeter()
+
+                  val hub ='''.replace('\n                  ', '\n        '))
+          old = '''                                val total = event.files.sumOf { if (it.total_bytes > 0) it.total_bytes else 0L }
+                                          val done = event.files.sumOf { it.downloaded_bytes }
+                                          val percent = if (total > 0) ((done * 100) / total).toInt() else 0
+                                          runOnUiThread { tvDownloadProgress.text = "$percent%" }'''
+          # Match indentation exactly from pinned upstream.
+          old = '\n'.join([old.splitlines()[0]] + ['                                '+line.strip() for line in old.splitlines()[1:]])
+          new = '''                                val done = event.files.sumOf { it.downloaded_bytes.coerceAtLeast(0L) }
+                                          val known = event.files.isNotEmpty() && event.files.all { it.total_bytes > 0L }
+                                          val total = if (known) event.files.sumOf { it.total_bytes } else null
+                                          val progress = meter.update(done, total, android.os.SystemClock.elapsedRealtime())
+                                          runOnUiThread {
+                                              tvDownloadProgress.text = progress.text
+                                              pbDownloading.isIndeterminate = progress.percent == null
+                                              progress.percent?.let { pbDownloading.progress = it }
+                                          }'''
+          new = '\n'.join([new.splitlines()[0]] + [line[10:] for line in new.splitlines()[1:]])
+          replace(p, old, new)
+          replace(p, '"Download failed. Please check your network connection and try again.",', '"Download failed (code \u0024{event.code}). Retry or check the network and free storage.",')
+          replace(p, '                    }\n                } finally {\n                    if (wakeLock.isHeld) wakeLock.release()', '''                    }
+                          } catch (e: kotlinx.coroutines.CancellationException) {
+                              throw e
+                          } catch (e: Exception) {
+                              Log.e(TAG, "Model download failed", e)
+                              runOnUiThread {
+                                  llDownloading.visibility = View.GONE
+                                  Toast.makeText(this@MainActivity, "Download failed: \u0024{e.javaClass.simpleName}", Toast.LENGTH_LONG).show()
+                              }
+                          } finally {
+                              if (wakeLock.isHeld) wakeLock.release()'''.replace('\n          ', '\n'))
+          replace(Path('build.gradle'), "applicationId 'com.geniex.demo'", "applicationId 'com.geniex.demo.tovarish.test'")
+          replace(Path('build.gradle'), "    // Testing (instrumented UI Automator tests under src/androidTest)", "    testImplementation 'junit:junit:4.13.2'\n\n    // Testing (instrumented UI Automator tests under src/androidTest)")
+          replace(Path('src/main/res/values/strings.xml'), '<string name="app_name">Tovarish</string>', '<string name="app_name">Tovarish Test</string>')
+          layout = Path('src/main/res/layout/activity_main.xml')
+          replace(layout, 'android:id="@+id/pb_downloading"\n', 'android:id="@+id/pb_downloading"\n            style="?android:attr/progressBarStyleHorizontal"\n            android:max="100"\n            android:indeterminate="true"\n')
+          replace(layout, 'android:id="@+id/tv_download_progress"\n            android:layout_width="wrap_content"\n            android:layout_height="wrap_content"\n            android:text="0%"', 'android:id="@+id/tv_download_progress"\n            android:layout_width="match_parent"\n            android:layout_height="wrap_content"\n            android:gravity="center"\n            android:padding="16dp"\n            android:text="Connecting…"')
+          p.with_name('DownloadMeter.kt').write_text('''package com.geniex.demo
+
+          import java.util.Locale
+
+          internal class DownloadMeter {
+              data class State(val text: String, val percent: Int?)
+              private var lastBytes: Long? = null
+              private var lastTime = 0L
+              private var rate: Double? = null
+
+              fun update(done: Long, total: Long?, now: Long): State {
+                  val previous = lastBytes
+                  if (previous == null || done < previous || now < lastTime) {
+                      lastBytes = done
+                      lastTime = now
+                      rate = null
+                  } else if (now - lastTime >= 500L) {
+                      val sample = (done - previous) * 1000.0 / (now - lastTime)
+                      rate = rate?.let { 0.6 * it + 0.4 * sample } ?: sample
+                      lastBytes = done
+                      lastTime = now
+                  }
+                  val validTotal = total?.takeIf { it > 0 && it >= done }
+                  val fraction = validTotal?.let { done.toDouble() / it }
+                  val percent = fraction?.let { (it * 100).toInt().coerceIn(0, 100) }
+                  val speed = rate?.let { fmt(it / 1e6) + " MB/s" } ?: "measuring…"
+                  val amount = if (validTotal != null) "\u0024{fmt(done / 1e6)} / \u0024{fmt(validTotal / 1e6)} MB" else "\u0024{fmt(done / 1e6)} MB (total unknown)"
+                  val eta = if (validTotal != null && rate != null && rate!! > 0.0) {
+                      val seconds = ((validTotal - done) / rate!!).toLong().coerceAtLeast(0)
+                      "\u0024{seconds / 60}m \u0024{seconds % 60}s remaining"
+                  } else "ETA unavailable"
+                  val header = fraction?.let { fmt(it * 100) + "%" } ?: "Downloading…"
+                  return State(listOf(header, amount, speed, eta).joinToString("\\n"), percent)
+              }
+
+              private fun fmt(value: Double) = String.format(Locale.US, "%.1f", value)
+          }
+          ''' )
+          t = Path('src/test/java/com/geniex/demo/DownloadMeterTest.kt')
+          t.parent.mkdir(parents=True, exist_ok=True)
+          t.write_text('''package com.geniex.demo
+
+          import org.junit.Assert.*
+          import org.junit.Test
+
+          class DownloadMeterTest {
+              @Test fun unknownTotalNeverShowsZeroPercent() {
+                  val m = DownloadMeter()
+                  m.update(0, null, 0)
+                  val s = m.update(2000000, null, 1000)
+                  assertNull(s.percent)
+                  assertTrue(s.text.contains("2.0 MB (total unknown)"))
+                  assertTrue(s.text.contains("2.0 MB/s"))
+                  assertTrue(s.text.contains("ETA unavailable"))
+              }
+
+              @Test fun knownTotalShowsFractionAndEta() {
+                  val m = DownloadMeter()
+                  m.update(0, 10000000, 0)
+                  val s = m.update(2000000, 10000000, 1000)
+                  assertEquals(20, s.percent)
+                  assertTrue(s.text.contains("20.0%"))
+                  assertTrue(s.text.contains("0m 4s remaining"))
+              }
+
+              @Test fun changingOrInvalidCountersDoNotFakeProgress() {
+                  val m = DownloadMeter()
+                  m.update(5000000, 10000000, 1000)
+                  val s = m.update(1000000, 500000, 2000)
+                  assertNull(s.percent)
+                  assertTrue(s.text.contains("measuring"))
+              }
+          }
+          ''')
+          PY
       - name: Build debug APK
         working-directory: upstream/geniex_chat_android
-        run: gradle --no-daemon assembleDebug
+        run: gradle --no-daemon testDebugUnitTest assembleDebug
       - name: Package test artifact and provenance
         run: |
           mkdir -p out
-          cp upstream/geniex_chat_android/build/outputs/apk/debug/app-debug.apk out/Tovarish-debug.apk
+          cp upstream/geniex_chat_android/build/outputs/apk/debug/app-debug.apk out/Tovarish-Test-debug.apk
           cp upstream/LICENSE out/QUALCOMM-LICENSE.txt
           git -C upstream rev-parse HEAD > out/upstream-commit.txt
-          "$ANDROID_HOME/build-tools/34.0.0/aapt" dump badging out/Tovarish-debug.apk > out/apk-info.txt
-          grep -F "application-label:'Tovarish'" out/apk-info.txt
-          "$ANDROID_HOME/build-tools/34.0.0/apksigner" verify --verbose out/Tovarish-debug.apk
-          (cd out && sha256sum Tovarish-debug.apk > SHA256SUMS.txt)
+          "$ANDROID_HOME/build-tools/34.0.0/aapt" dump badging out/Tovarish-Test-debug.apk > out/apk-info.txt
+          grep -F "application-label:'Tovarish Test'" out/apk-info.txt
+          "$ANDROID_HOME/build-tools/34.0.0/apksigner" verify --verbose out/Tovarish-Test-debug.apk
+          (cd out && sha256sum Tovarish-Test-debug.apk > SHA256SUMS.txt)
       - uses: actions/upload-artifact@v4
         id: artifact
         continue-on-error: true
         with:
-          name: Tovarish-baseline-debug
+          name: Tovarish-download-diagnostics
           path: out/
           if-no-files-found: error
           retention-days: 7
