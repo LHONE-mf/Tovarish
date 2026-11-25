@@ -211,6 +211,154 @@ jobs:
                   } catch (e: kotlinx.coroutines.CancellationException) {''')
           p.write_text(s)
           PY
+      - name: Add model inventory and serialized download retry
+        working-directory: upstream/geniex_chat_android
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          p = Path('src/main/java/com/geniex/demo/MainActivity.kt')
+          s = p.read_text()
+          def replace(old, new, count=1):
+              global s
+              assert s.count(old) == count, old
+              s = s.replace(old, new)
+          replace('private var downloadJob: Job? = null', '''private var downloadJob: Job? = null
+              private var changingDownload = false
+              private var managingModels = false''')
+          replace('if (downloadJob?.isActive == true) {', 'if (changingDownload || downloadJob?.isCompleted == false) {', 2)
+          replace('private fun downloadModel(selectModelData: ModelData) {', '''private fun downloadModel(selectModelData: ModelData) {
+                  if (managingModels || llLoading.visibility == View.VISIBLE) return''')
+          replace('''        binding.btnCancelDownload.setOnClickListener {
+                      downloadJob?.cancel()
+                      downloadJob = null
+                      tvDownloadProgress.text = "0%"
+                      binding.llDownloading.visibility = View.GONE
+                  }
+                  binding.btnRetryDownload.setOnClickListener {
+                      downloadJob?.cancel()
+                      downloadJob = null
+                      downloadingModelData?.let { downloadModel(it) }
+                  }'''.replace('\n          ', '\n'), '''        binding.btnCancelDownload.setOnClickListener { finishDownload(false) }
+                  binding.btnRetryDownload.setOnClickListener { finishDownload(true) }
+                  binding.btnManageModels.setOnClickListener { showModelInventory() }'''.replace('\n          ', '\n'))
+          replace('btnLoadModel.setOnClickListener {\n', '''btnLoadModel.setOnClickListener {
+                      if (managingModels || changingDownload || downloadJob?.isCompleted == false) {
+                          Toast.makeText(this@MainActivity, "Finish or pause the current download first.", Toast.LENGTH_SHORT).show()
+                          return@setOnClickListener
+                      }
+          '''.replace('\n          ', '\n'))
+          replace('    private fun setListeners() {', '''    private fun finishDownload(retry: Boolean) {
+                  if (changingDownload) return
+                  changingDownload = true
+                  binding.btnCancelDownload.isEnabled = false
+                  binding.btnRetryDownload.isEnabled = false
+                  val previous = downloadJob
+                  val model = downloadingModelData
+                  tvDownloadProgress.text = "Stopping download safely…"
+                  modelScope.launch(Dispatchers.Main) {
+                      try {
+                          previous?.cancel()
+                          previous?.join()
+                          downloadJob = null
+                          changingDownload = false
+                          if (retry && model != null) {
+                              downloadModel(model)
+                          } else {
+                              llDownloading.visibility = View.GONE
+                              Toast.makeText(this@MainActivity, "Download paused. Use Download to continue.", Toast.LENGTH_LONG).show()
+                          }
+                      } finally {
+                          changingDownload = false
+                          binding.btnCancelDownload.isEnabled = true
+                          binding.btnRetryDownload.isEnabled = true
+                      }
+                  }
+              }
+
+              private fun showModelInventory() {
+                  if (managingModels || changingDownload || downloadJob?.isCompleted == false || hasLoadedModel() || isGenerating || llLoading.visibility == View.VISIBLE) {
+                      Toast.makeText(this, "Pause downloads and unload the model first.", Toast.LENGTH_SHORT).show()
+                      return
+                  }
+                  managingModels = true
+                  val button = binding.btnManageModels
+                  button.isEnabled = false
+                  modelScope.launch(Dispatchers.Main) {
+                      try {
+                          val installed = kotlinx.coroutines.withContext(Dispatchers.IO) {
+                              modelList.filter { ModelManagerWrapper.getPaths(it.modelName) != null }
+                                  .distinctBy { it.modelName }
+                          }
+                          val free = android.os.StatFs(filesDir.absolutePath).availableBytes / 1e9
+                          val title = String.format(Locale.US, "Installed models · %.1f GB free", free)
+                          if (isFinishing || isDestroyed) {
+                              managingModels = false
+                              button.isEnabled = true
+                              return@launch
+                          }
+                          val dialog = AlertDialog.Builder(this@MainActivity).setTitle(title)
+                          if (installed.isEmpty()) {
+                              dialog.setMessage("No complete catalog models downloaded.")
+                          } else {
+                              dialog.setItems(installed.map { it.displayName }.toTypedArray()) { _, index ->
+                                  val selected = installed[index]
+                                  AlertDialog.Builder(this@MainActivity)
+                                      .setTitle("Remove model?")
+                                      .setMessage(selected.displayName + "\\nOnly this downloaded model will be removed. You can download it again.")
+                                      .setNegativeButton("Keep", null)
+                                      .setPositiveButton("Remove") { _, _ ->
+                                          if (managingModels || changingDownload || downloadJob?.isCompleted == false || hasLoadedModel() || isGenerating || llLoading.visibility == View.VISIBLE) {
+                                              Toast.makeText(this@MainActivity, "Model is busy.", Toast.LENGTH_SHORT).show()
+                                              return@setPositiveButton
+                                          }
+                                          managingModels = true
+                                          button.isEnabled = false
+                                          modelScope.launch(Dispatchers.Main) {
+                                              try {
+                                                  val rc = ModelManagerWrapper.remove(selected.modelName)
+                                                  Toast.makeText(this@MainActivity, if (rc == 0) "Model removed" else "Remove failed: " + rc, Toast.LENGTH_LONG).show()
+                                              } catch (e: Exception) {
+                                                  Toast.makeText(this@MainActivity, "Remove failed: " + e.javaClass.simpleName, Toast.LENGTH_LONG).show()
+                                              } finally {
+                                                  managingModels = false
+                                                  button.isEnabled = true
+                                              }
+                                          }
+                                      }
+                                      .show()
+                              }
+                          }
+                          dialog.setNegativeButton("Close", null).setOnDismissListener {
+                              managingModels = false
+                              button.isEnabled = true
+                          }.show()
+                      } catch (e: Exception) {
+                          managingModels = false
+                          button.isEnabled = true
+                          Toast.makeText(this@MainActivity, "Model list unavailable", Toast.LENGTH_LONG).show()
+                      }
+                  }
+              }
+
+              private fun setListeners() {'''.replace('\n          ', '\n'))
+          p.write_text(s)
+          layout = Path('src/main/res/layout/activity_main.xml')
+          xml = layout.read_text()
+          marker = '        <!-- Control buttons section -->'
+          assert xml.count(marker) == 1
+          xml = xml.replace(marker, '''        <Button
+                      android:id="@+id/btn_manage_models"
+                      android:layout_width="match_parent"
+                      android:layout_height="40dp"
+                      android:layout_marginStart="16dp"
+                      android:layout_marginEnd="16dp"
+                      android:text="Installed models / Storage"
+                      android:textAllCaps="false" />
+
+          '''.replace('\n          ', '\n') + marker)
+          xml = xml.replace('android:text="cancel"', 'android:text="Pause"').replace('android:text="retry"', 'android:text="Retry"')
+          layout.write_text(xml)
+          PY
       - name: Build debug APK
         working-directory: upstream/geniex_chat_android
         run: gradle --no-daemon testDebugUnitTest assembleDebug
