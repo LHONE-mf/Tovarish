@@ -202,8 +202,7 @@ jobs:
                       try {
                           ModelManagerWrapper.pullFlow(input).collect { event ->''')
           replace('tvDownloadProgress.text = progress.text', '''sdkText = progress.text
-                                              lastCallbackAt = android.os.SystemClock.elapsedRealtime()
-                                              tvDownloadProgress.text = sdkText''')
+                                              lastCallbackAt = android.os.SystemClock.elapsedRealtime()''')
           marker = '} catch (e: kotlinx.coroutines.CancellationException) {'
           replace(marker, '''} finally {
                           monitor.cancel()
@@ -411,6 +410,23 @@ jobs:
           # Basic resource validation before invoking Android's resource compiler.
           for p in [colors, theme, root/'AndroidManifest.xml', *res.glob('layout*/*.xml')]:
               ET.parse(p)
+          PY
+      - name: Stabilize download status layout
+        working-directory: upstream/geniex_chat_android
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          import xml.etree.ElementTree as ET
+          p = Path('src/main/res/layout/activity_main.xml')
+          s = p.read_text()
+          marker = 'android:id="@+id/tv_download_progress"'
+          assert s.count(marker) == 1
+          s = s.replace(marker, marker + '\n            android:minLines="6"')
+          p.write_text(s)
+          ET.parse(p)
+          kotlin = Path('src/main/java/com/geniex/demo/MainActivity.kt').read_text()
+          assert 'tvDownloadProgress.text = sdkText + ' in kotlin
+          assert 'tvDownloadProgress.text = sdkText\n' not in kotlin
           PY
       - name: Build debug APK
         working-directory: upstream/geniex_chat_android
