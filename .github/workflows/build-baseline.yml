@@ -428,6 +428,89 @@ jobs:
           assert 'tvDownloadProgress.text = sdkText + ' in kotlin
           assert 'tvDownloadProgress.text = sdkText\n' not in kotlin
           PY
+      - name: Select chipset-specific NPU bundles and record native load diagnostics
+        working-directory: upstream/geniex_chat_android
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          p = Path('src/main/java/com/geniex/demo/MainActivity.kt')
+          s = p.read_text()
+          def replace(old, new):
+              global s
+              assert s.count(old) == 1, old
+              s = s.replace(old, new)
+          replace('modelList = json.decodeFromString<List<ModelData>>(baseJson)', '''val chipset = android.os.Build.SOC_MODEL.trim().uppercase(Locale.US)
+              val supportedChipsets = setOf("SM8750", "SM8850")
+              val verifiedNpuModels = setOf("Qwen3-4B", "Qwen3-4B-Instruct-2507")
+              modelList = json.decodeFromString<List<ModelData>>(baseJson).mapNotNull { model ->
+                  when {
+                      model.runtime != "qairt" -> model
+                      chipset !in supportedChipsets -> null
+                      model.id !in verifiedNpuModels -> null
+                      else -> model.copy(chipset = chipset, displayName = model.displayName + " · " + chipset)
+                  }
+              }
+              Log.i(TAG, "SoC="+chipset+" model="+android.os.Build.MODEL+" NPU catalog="+modelList.count { it.runtime == "qairt" })''')
+          replace('        setListeners()\n    }', '''        setListeners()
+                  val interrupted = getSharedPreferences("native_load", MODE_PRIVATE).getString("pending", null)
+                  if (interrupted != null) {
+                      AlertDialog.Builder(this)
+                          .setTitle("Previous native load interrupted")
+                          .setMessage(interrupted + "\\nNPU loading is blocked for this model until a corrected build is installed. Other models remain available.")
+                          .setPositiveButton("OK", null)
+                          .show()
+                  }
+              }''')
+          replace('''        modelScope.launch {
+                      resetLoadState()
+                      val paths = ModelManagerWrapper.getPaths(selectModelData.modelName)'''.replace('\n          ', '\n'), '''        modelScope.launch {
+                      resetLoadState()
+          replace('            val pluginId = paths.runtime_id.ifEmpty { modelDataPluginId }', '''            val pluginId = paths.runtime_id.ifEmpty { modelDataPluginId }
+                      val isNativeNpu = pluginId == "qairt" || selectModelData.runtime == "qairt"
+                      val loadPrefs = getSharedPreferences("native_load", MODE_PRIVATE)
+                      if (isNativeNpu) {
+                          val chip = android.os.Build.SOC_MODEL.trim().uppercase(Locale.US)
+                          if (chip != selectModelData.chipset || chip !in setOf("SM8750", "SM8850")) {
+                              onLoadModelFailed("NPU chipset mismatch: "+chip)
+                              return@launch
+                          }
+                          if (loadPrefs.getString("pending_id", null) == selectModelData.id) {
+                              onLoadModelFailed("Previous native load was interrupted. Retry blocked in this build.")
+                              return@launch
+                          }
+                          val manager = getSystemService(Context.ACTIVITY_SERVICE) as android.app.ActivityManager
+                          val memory = android.app.ActivityManager.MemoryInfo()
+                          manager.getMemoryInfo(memory)
+                          val details = selectModelData.displayName + " | SoC=" + chip + " | Android=" + android.os.Build.VERSION.SDK_INT + " | runtime=" + pluginId + " | available RAM=" + (memory.availMem / 1048576) + " MiB | total RAM=" + (memory.totalMem / 1048576) + " MiB"
+                          Log.i(TAG, "Native load preflight: "+details)
+                          if (memory.lowMemory) {
+                              onLoadModelFailed("Android reports low memory; native load not started.")
+                              return@launch
+                          }
+                          if (!loadPrefs.edit().putString("pending_id", selectModelData.id).putString("pending", details).commit()) {
+                              onLoadModelFailed("Cannot save native load diagnostic.")
+                              return@launch
+                          }
+                      }''')
+          replace('''                        .onSuccess { wrapper ->
+                                      isLoadLlmModel = true'''.replace('\n          ', '\n'), '''                        .onSuccess { wrapper ->
+                                      if (isNativeNpu) loadPrefs.edit().remove("pending_id").remove("pending").commit()
+          replace('                            isLoadLlmModel = true', '''                            if (isNativeNpu) loadPrefs.edit().remove("pending_id").remove("pending").commit()
+                                      isLoadLlmModel = true''')
+          replace('''                            onLoadModelFailed(error.message.toString())''', '''                            if (isNativeNpu) loadPrefs.edit().remove("pending_id").remove("pending").commit()
+          old = '                            onLoadModelFailed(error.message.toString())'
+          assert s.count(old) == 2
+          s = s.replace(old, '                            if (isNativeNpu) loadPrefs.edit().remove("pending_id").remove("pending").commit()\n'+old)
+          replace('                            isLoadVlmModel = true', '''                            if (isNativeNpu) loadPrefs.edit().remove("pending_id").remove("pending").commit()
+                                      isLoadVlmModel = true''')
+          p.write_text(s)
+          # New sandbox prevents a previous SM8750 cache from masquerading as SM8850.
+          build = Path('build.gradle')
+          gradle = build.read_text()
+          old = "applicationId 'com.geniex.demo.tovarish.test'"
+          assert gradle.count(old) == 1
+          build.write_text(gradle.replace(old, "applicationId 'com.geniex.demo.tovarish.chipsettest'"))
+          PY
       - name: Build debug APK
         working-directory: upstream/geniex_chat_android
         run: gradle --no-daemon testDebugUnitTest assembleDebug
