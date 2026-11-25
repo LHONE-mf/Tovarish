@@ -1,0 +1,58 @@
+name: Build Tovarish baseline APK
+on:
+  pull_request:
+  workflow_dispatch:
+  push:
+    branches: [main, build/geniex-baseline]
+permissions:
+  contents: read
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: qualcomm/ai-hub-apps
+          ref: e6477cfa238acaffe01ed45de4cfcbd53abbc99d
+          path: upstream
+          persist-credentials: false
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.13'
+      - name: Install Android SDK components
+        run: sdkmanager 'platforms;android-34' 'build-tools;34.0.0' 'ndk;27.3.13750724'
+      - name: Rename launcher label
+        working-directory: upstream/geniex_chat_android
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          p = Path('src/main/res/values/strings.xml')
+          s = p.read_text()
+          old = '<string name="app_name">GenieXDemo</string>'
+          assert s.count(old) == 1, 'Unexpected upstream app label'
+          p.write_text(s.replace(old, '<string name="app_name">Tovarish</string>'))
+          PY
+      - name: Build debug APK
+        working-directory: upstream/geniex_chat_android
+        run: gradle --no-daemon assembleDebug
+      - name: Package test artifact and provenance
+        run: |
+          mkdir -p out
+          cp upstream/geniex_chat_android/build/outputs/apk/debug/app-debug.apk out/Tovarish-debug.apk
+          cp upstream/LICENSE out/QUALCOMM-LICENSE.txt
+          git -C upstream rev-parse HEAD > out/upstream-commit.txt
+          "$ANDROID_HOME/build-tools/34.0.0/aapt" dump badging out/Tovarish-debug.apk > out/apk-info.txt
+          grep -F "application-label:'Tovarish'" out/apk-info.txt
+          "$ANDROID_HOME/build-tools/34.0.0/apksigner" verify --verbose out/Tovarish-debug.apk
+          (cd out && sha256sum Tovarish-debug.apk > SHA256SUMS.txt)
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Tovarish-baseline-debug
+          path: out/
+          if-no-files-found: error
+          retention-days: 14
