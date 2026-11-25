@@ -41,59 +41,6 @@ jobs:
           assert s.count(old) == 1, 'Unexpected upstream app label'
           p.write_text(s.replace(old, '<string name="app_name">Tovarish</string>'))
           PY
-      - name: Improve model download diagnostics
-        working-directory: upstream/geniex_chat_android
-        run: |
-          python - <<'PY'
-          from pathlib import Path
-          p = Path('src/main/java/com/geniex/demo/MainActivity.kt')
-          s = p.read_text()
-          def replace(old, new):
-              global s
-              assert s.count(old) == 1, old
-              s = s.replace(old, new)
-          replace('tvDownloadProgress.text = "0%"\n\n        val hub', '''tvDownloadProgress.text = "Connecting to model server…"
-                  pbDownloading.isIndeterminate = true
-                  val startedAt = android.os.SystemClock.elapsedRealtime()
-                  val initialRx = android.net.TrafficStats.getUidRxBytes(android.os.Process.myUid())
-                  var lastProgressAt = startedAt
-                  var lastDone = 0L
-                  var lastTotal = 0L
-
-                  val hub''')
-          replace('''                    ModelManagerWrapper.pullFlow(input).collect { event ->''', '''                    val monitor = launch(Dispatchers.Main) {
-                          while (true) {
-                              kotlinx.coroutines.delay(1000)
-                              val now = android.os.SystemClock.elapsedRealtime()
-                              val rx = android.net.TrafficStats.getUidRxBytes(android.os.Process.myUid())
-                              val traffic = if (initialRx >= 0 && rx >= initialRx) String.format(Locale.US, "%.1f MB app traffic", (rx - initialRx) / 1e6) else "App traffic unavailable"
-                              val elapsed = (now - startedAt) / 1000
-                              val rate = if (elapsed > 0 && initialRx >= 0 && rx >= initialRx) String.format(Locale.US, "%.2f MB/s avg", (rx - initialRx) / 1e6 / elapsed) else "Rate unavailable"
-                              val progress = if (lastTotal > 0) String.format(Locale.US, "%.1f%% · %.1f / %.1f MB", 100.0 * lastDone / lastTotal, lastDone / 1e6, lastTotal / 1e6) else String.format(Locale.US, "%.1f MB reported · total unknown", lastDone / 1e6)
-                              val status = if (now - lastProgressAt > 15000) "Waiting for SDK progress" else "Downloading"
-                              tvDownloadProgress.text = "$status · ${elapsed}s\\n$progress\\n$traffic · $rate"
-                              pbDownloading.isIndeterminate = lastTotal <= 0
-                              if (lastTotal > 0) pbDownloading.progress = (100.0 * lastDone / lastTotal).toInt().coerceIn(0, 100)
-                          }
-                      }
-                      try {
-                      ModelManagerWrapper.pullFlow(input).collect { event ->''')
-          replace('''                                val percent = if (total > 0) ((done * 100) / total).toInt() else 0
-                                          runOnUiThread { tvDownloadProgress.text = "$percent%" }'''.replace('                                          runOnUiThread','                                runOnUiThread'), '''                                kotlinx.coroutines.withContext(Dispatchers.Main) {
-                                              lastDone = done
-                                              lastTotal = if (event.files.isNotEmpty() && event.files.all { it.total_bytes > 0 }) total else 0L
-                                              lastProgressAt = android.os.SystemClock.elapsedRealtime()
-                                          }''')
-          replace('''                    }
-                          } finally {
-                              if (wakeLock.isHeld) wakeLock.release()'''.replace('                          } finally','                } finally').replace('                              if (wakeLock','                    if (wakeLock'), '''                    }
-                      } finally {
-                          monitor.cancel()
-                      }
-                  } finally {
-                      if (wakeLock.isHeld) wakeLock.release()''')
-          p.write_text(s)
-          PY
       - name: Add download diagnostics to isolated test app
         working-directory: upstream/geniex_chat_android
         run: |
@@ -218,6 +165,51 @@ jobs:
               }
           }
           ''')
+          PY
+      - name: Show app traffic even when SDK callbacks stall
+        working-directory: upstream/geniex_chat_android
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          p = Path('src/main/java/com/geniex/demo/MainActivity.kt')
+          s = p.read_text()
+          def replace(old, new):
+              global s
+              assert s.count(old) == 1, old
+              s = s.replace(old, new)
+          replace('val meter = DownloadMeter()', '''val meter = DownloadMeter()
+                  val startedAt = android.os.SystemClock.elapsedRealtime()
+                  val initialRx = android.net.TrafficStats.getUidRxBytes(android.os.Process.myUid())
+                  var sdkText = "Waiting for SDK progress…"
+                  var lastCallbackAt = startedAt''')
+          replace('ModelManagerWrapper.pullFlow(input).collect { event ->', '''val monitor = launch(Dispatchers.Main) {
+                          var previousRx = initialRx
+                          var previousAt = startedAt
+                          while (true) {
+                              val now = android.os.SystemClock.elapsedRealtime()
+                              val rx = android.net.TrafficStats.getUidRxBytes(android.os.Process.myUid())
+                              val elapsedMs = now - previousAt
+                              val traffic = if (initialRx >= 0 && rx >= initialRx) String.format(Locale.US, "%.1f MB app traffic", (rx - initialRx) / 1e6) else "App traffic unavailable"
+                              val speed = if (previousRx >= 0 && rx >= previousRx && elapsedMs > 0) String.format(Locale.US, "%.2f MB/s", (rx - previousRx) / 1000.0 / elapsedMs) else "Measuring…"
+                              val elapsed = (now - startedAt) / 1000
+                              val age = (now - lastCallbackAt) / 1000
+                              tvDownloadProgress.text = sdkText + "\\n" + traffic + " · " + speed + "\\nElapsed: " + elapsed + "s · SDK update: " + age + "s ago"
+                              previousRx = rx
+                              previousAt = now
+                              kotlinx.coroutines.delay(1000)
+                          }
+                      }
+                      try {
+                          ModelManagerWrapper.pullFlow(input).collect { event ->''')
+          replace('tvDownloadProgress.text = progress.text', '''sdkText = progress.text
+                                              lastCallbackAt = android.os.SystemClock.elapsedRealtime()
+                                              tvDownloadProgress.text = sdkText''')
+          marker = '} catch (e: kotlinx.coroutines.CancellationException) {'
+          replace(marker, '''} finally {
+                          monitor.cancel()
+                      }
+                  } catch (e: kotlinx.coroutines.CancellationException) {''')
+          p.write_text(s)
           PY
       - name: Build debug APK
         working-directory: upstream/geniex_chat_android
