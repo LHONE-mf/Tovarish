@@ -228,19 +228,7 @@ jobs:
           replace('if (downloadJob?.isActive == true) {', 'if (changingDownload || downloadJob?.isCompleted == false) {', 2)
           replace('private fun downloadModel(selectModelData: ModelData) {', '''private fun downloadModel(selectModelData: ModelData) {
                   if (managingModels || llLoading.visibility == View.VISIBLE) return''')
-          replace('''        binding.btnCancelDownload.setOnClickListener {
-                      downloadJob?.cancel()
-                      downloadJob = null
-                      tvDownloadProgress.text = "0%"
-                      binding.llDownloading.visibility = View.GONE
-                  }
-                  binding.btnRetryDownload.setOnClickListener {
-                      downloadJob?.cancel()
-                      downloadJob = null
-                      downloadingModelData?.let { downloadModel(it) }
-                  }'''.replace('\n          ', '\n'), '''        binding.btnCancelDownload.setOnClickListener { finishDownload(false) }
-                  binding.btnRetryDownload.setOnClickListener { finishDownload(true) }
-                  binding.btnManageModels.setOnClickListener { showModelInventory() }'''.replace('\n          ', '\n'))
+          replace("        binding.btnCancelDownload.setOnClickListener {\n            downloadJob?.cancel()\n            downloadJob = null\n            tvDownloadProgress.text = \"0%\"\n            binding.llDownloading.visibility = View.GONE\n        }\n        binding.btnRetryDownload.setOnClickListener {\n            downloadJob?.cancel()\n            downloadJob = null\n            downloadingModelData?.let { downloadModel(it) }\n        }", "        binding.btnCancelDownload.setOnClickListener { finishDownload(false) }\n        binding.btnRetryDownload.setOnClickListener { finishDownload(true) }\n        binding.btnManageModels.setOnClickListener { showModelInventory() }")
           replace('btnLoadModel.setOnClickListener {\n', '''btnLoadModel.setOnClickListener {
                       if (managingModels || changingDownload || downloadJob?.isCompleted == false) {
                           Toast.makeText(this@MainActivity, "Finish or pause the current download first.", Toast.LENGTH_SHORT).show()
@@ -370,7 +358,7 @@ jobs:
           git -C upstream rev-parse HEAD > out/upstream-commit.txt
           "$ANDROID_HOME/build-tools/34.0.0/aapt" dump badging out/Tovarish-Test-debug.apk > out/apk-info.txt
           grep -F "application-label:'Tovarish Test'" out/apk-info.txt
-          "$ANDROID_HOME/build-tools/34.0.0/apksigner" verify --verbose out/Tovarish-Test-debug.apk
+          "$ANDROID_HOME/build-tools/34.0.0/apksigner" verify --verbose --print-certs out/Tovarish-Test-debug.apk
           (cd out && sha256sum Tovarish-Test-debug.apk > SHA256SUMS.txt)
       - uses: actions/upload-artifact@v4
         id: artifact
