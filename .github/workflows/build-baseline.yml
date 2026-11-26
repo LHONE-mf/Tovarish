@@ -228,6 +228,11 @@ jobs:
           replace('private fun downloadModel(selectModelData: ModelData) {', '''private fun downloadModel(selectModelData: ModelData) {
                   if (managingModels || llLoading.visibility == View.VISIBLE) return''')
           replace("        binding.btnCancelDownload.setOnClickListener {\n            downloadJob?.cancel()\n            downloadJob = null\n            tvDownloadProgress.text = \"0%\"\n            binding.llDownloading.visibility = View.GONE\n        }\n        binding.btnRetryDownload.setOnClickListener {\n            downloadJob?.cancel()\n            downloadJob = null\n            downloadingModelData?.let { downloadModel(it) }\n        }", "        binding.btnCancelDownload.setOnClickListener { finishDownload(false) }\n        binding.btnRetryDownload.setOnClickListener { finishDownload(true) }\n        binding.btnManageModels.setOnClickListener { showModelInventory() }")
+          replace('btnDownload.setOnClickListener {', '''btnDownload.setOnClickListener {
+                      if (changingDownload) {
+                          Toast.makeText(this@MainActivity, "Previous download is still stopping. Open Android app settings if stuck.", Toast.LENGTH_LONG).show()
+                          return@setOnClickListener
+                      }''')
           replace('btnLoadModel.setOnClickListener {\n', '''btnLoadModel.setOnClickListener {
                       if (managingModels || changingDownload || downloadJob?.isCompleted == false) {
                           Toast.makeText(this@MainActivity, "Finish or pause the current download first.", Toast.LENGTH_SHORT).show()
@@ -241,18 +246,35 @@ jobs:
                   binding.btnRetryDownload.isEnabled = false
                   val previous = downloadJob
                   val model = downloadingModelData
-                  tvDownloadProgress.text = "Stopping download safely…"
+                  tvDownloadProgress.text = "Stopping download…"
                   modelScope.launch(Dispatchers.Main) {
                       try {
                           previous?.cancel()
-                          previous?.join()
+                          val stopped = kotlinx.coroutines.withTimeoutOrNull(3000L) {
+                              previous?.join()
+                              true
+                          } == true
+                          if (!stopped) {
+                              llDownloading.visibility = View.GONE
+                              if (!isFinishing && !isDestroyed) {
+                                  AlertDialog.Builder(this@MainActivity)
+                                      .setTitle("Download stop pending")
+                                      .setMessage("The native downloader has not stopped yet. Another model cannot be downloaded or loaded until it stops. If it remains stuck, force stop Tovarish in Android app settings and reopen it.")
+                                      .setNegativeButton("Close", null)
+                                      .setPositiveButton("App settings") { _, _ ->
+                                          startActivity(android.content.Intent(android.provider.Settings.ACTION_APPLICATION_DETAILS_SETTINGS, android.net.Uri.parse("package:"+packageName)))
+                                      }.show()
+                              }
+                              previous?.join()
+                          }
                           downloadJob = null
                           changingDownload = false
-                          if (retry && model != null) {
+                          if (isFinishing || isDestroyed) return@launch
+                          if (stopped && retry && model != null) {
                               downloadModel(model)
                           } else {
                               llDownloading.visibility = View.GONE
-                              Toast.makeText(this@MainActivity, "Download paused. Use Download to continue.", Toast.LENGTH_LONG).show()
+                              Toast.makeText(this@MainActivity, "Download stopped. Select a model and press Download.", Toast.LENGTH_LONG).show()
                           }
                       } finally {
                           changingDownload = false
