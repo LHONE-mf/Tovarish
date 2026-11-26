@@ -525,6 +525,97 @@ jobs:
           assert gradle.count(old) == 1
           build.write_text(gradle.replace(old, "applicationId 'com.geniex.demo.tovarish.chipsettest'"))
           PY
+      - name: Move downloads into an Android foreground data-sync service
+        working-directory: upstream/geniex_chat_android
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          import xml.etree.ElementTree as ET
+          root = Path('src/main')
+          p = root / 'java/com/geniex/demo/MainActivity.kt'
+          s = p.read_text()
+          def replace(old, new):
+              global s
+              assert s.count(old) == 1, old
+              s = s.replace(old, new)
+          def section(start, end, new):
+              global s
+              a = s.index(start)
+              b = s.index(end, a)
+              s = s[:a] + new + s[b:]
+          replace('private var downloadJob: Job? = null', 'private var downloadObserver: Job? = null')
+          replace('private var changingDownload = false', 'private val changingDownload: Boolean get() = ModelDownloadService.state.value.stopping')
+          replace('private var downloadingModelData: ModelData? = null', 'private val downloadingModelData: ModelData? get() = ModelDownloadService.selected')
+          s = s.replace('downloadJob?.isCompleted == false', 'ModelDownloadService.state.value.busy')
+          section('    private fun downloadModel(selectModelData: ModelData) {', '    private fun finishDownload(retry: Boolean) {', '''    private fun downloadModel(selectModelData: ModelData) {
+                  if (managingModels || hasLoadedModel() || isGenerating || llLoading.visibility == View.VISIBLE) return
+                  if (ModelDownloadService.state.value.busy) return
+                  ModelDownloadService.begin(this, selectModelData)
+              }
+          
+          ''')
+          section('    private fun finishDownload(retry: Boolean) {', '    private fun showModelInventory()', '''    private fun finishDownload(retry: Boolean) {
+                  if (ModelDownloadService.state.value.busy) {
+                      ModelDownloadService.pause(this)
+                  } else if (retry) {
+                      downloadingModelData?.let { downloadModel(it) }
+                  }
+              }
+          
+              private fun observeDownloads() {
+                  downloadObserver = modelScope.launch(Dispatchers.Main) {
+                      var previousBusy = false
+                      var warned = false
+                      ModelDownloadService.state.collect { state ->
+                          if (isFinishing || isDestroyed) return@collect
+                          llDownloading.visibility = if (state.busy && !state.timedOut || state.error) View.VISIBLE else View.GONE
+                          tvDownloadProgress.text = state.name + "\\n" + state.text
+                          pbDownloading.isIndeterminate = state.percent == null
+                          state.percent?.let { pbDownloading.progress = it }
+                          binding.btnCancelDownload.isEnabled = state.busy && !state.stopping
+                          binding.btnRetryDownload.isEnabled = !state.stopping
+                          if (state.timedOut && !warned) {
+                              warned = true
+                              AlertDialog.Builder(this@MainActivity)
+                                  .setTitle("Download stop pending")
+                                  .setMessage("The native downloader has not stopped. You can reopen Android app settings and force stop Tovarish if needed.")
+                                  .setNegativeButton("Close", null)
+                                  .setPositiveButton("App settings") { _, _ ->
+                                      startActivity(android.content.Intent(android.provider.Settings.ACTION_APPLICATION_DETAILS_SETTINGS, android.net.Uri.parse("package:"+packageName)))
+                                  }.show()
+                          }
+                          if (!state.busy) {
+                              warned = false
+                              if (previousBusy && state.text.isNotBlank())
+                                  Toast.makeText(this@MainActivity, state.text, Toast.LENGTH_LONG).show()
+                          }
+                          previousBusy = state.busy
+                      }
+                  }
+              }
+          
+              override fun onDestroy() {
+                  downloadObserver?.cancel()
+                  super.onDestroy()
+              }
+          
+          ''')
+          replace('        setListeners()\n', '        setListeners()\n        observeDownloads()\n')
+          assert 'downloadJob' not in s
+          p.write_text(s)
+          manifest = root / 'AndroidManifest.xml'
+          xml = manifest.read_text()
+          marker = '<uses-permission android:name="android.permission.WAKE_LOCK" />'
+          assert xml.count(marker) == 1
+          xml = xml.replace(marker, marker + '\n    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />\n    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />\n    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />')
+          marker = '        <provider\n'
+          assert xml.count(marker) == 1
+          xml = xml.replace(marker, '        <service android:name=".ModelDownloadService" android:exported="false" android:foregroundServiceType="dataSync" />\n\n' + marker)
+          ET.fromstring(xml)
+          manifest.write_text(xml)
+          
+          p.with_name('ModelDownloadService.kt').write_text("package com.geniex.demo\n\nimport android.app.Notification\nimport android.app.NotificationChannel\nimport android.app.NotificationManager\nimport android.app.PendingIntent\nimport android.app.Service\nimport android.content.Context\nimport android.content.Intent\nimport android.os.IBinder\nimport android.os.PowerManager\nimport android.os.SystemClock\nimport com.geniex.demo.bean.ModelData\nimport com.geniex.sdk.ModelManagerWrapper\nimport com.geniex.sdk.bean.HubSource\nimport com.geniex.sdk.bean.ModelPullInput\nimport kotlinx.coroutines.*\nimport kotlinx.coroutines.flow.MutableStateFlow\nimport kotlinx.coroutines.flow.asStateFlow\n\ninternal class ModelDownloadService : Service() {\n    data class Status(val busy: Boolean = false, val stopping: Boolean = false,\n        val timedOut: Boolean = false, val name: String = \"\", val text: String = \"\",\n        val percent: Int? = null, val error: Boolean = false)\n    companion object {\n        private val mutable = MutableStateFlow(Status())\n        val state = mutable.asStateFlow()\n        var selected: ModelData? = null\n            private set\n        fun begin(context: Context, model: ModelData) {\n            if (mutable.value.busy) return\n            selected = model\n            mutable.value = Status(busy = true, name = model.displayName, text = \"Connecting…\")\n            try {\n                context.startForegroundService(Intent(context, ModelDownloadService::class.java))\n            } catch (e: Exception) {\n                mutable.value = Status(name = model.displayName, text = \"Cannot start download: \" + e.javaClass.simpleName, error = true)\n            }\n        }\n        fun pause(context: Context) {\n            if (!mutable.value.busy || mutable.value.stopping) return\n            try {\n                context.startService(Intent(context, ModelDownloadService::class.java).setAction(\"pause\"))\n            } catch (e: Exception) {\n                mutable.value = mutable.value.copy(text = \"Cannot request pause: \" + e.javaClass.simpleName)\n            }\n        }\n    }\n    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)\n    private var task: Job? = null\n    private var wake: PowerManager.WakeLock? = null\n    private lateinit var notifications: NotificationManager\n    private val channel = \"model_downloads\"\n    private val notificationId = 4201\n    override fun onBind(intent: Intent?): IBinder? = null\n    override fun onCreate() {\n        super.onCreate()\n        notifications = getSystemService(NotificationManager::class.java)\n        notifications.createNotificationChannel(NotificationChannel(channel, \"Model downloads\", NotificationManager.IMPORTANCE_LOW))\n    }\n    private fun notification(): Notification {\n        val status = mutable.value\n        val open = PendingIntent.getActivity(this, 0, Intent(this, MainActivity::class.java)\n            .addFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP or Intent.FLAG_ACTIVITY_CLEAR_TOP), PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT)\n        return Notification.Builder(this, channel)\n            .setSmallIcon(android.R.drawable.stat_sys_download)\n            .setContentTitle(status.name.ifEmpty { \"Tovarish download\" })\n            .setContentText(if (status.stopping) \"Stopping…\" else status.text.lineSequence().firstOrNull().orEmpty())\n            .setProgress(100, status.percent ?: 0, status.percent == null)\n            .setOnlyAlertOnce(true).setOngoing(true).setContentIntent(open).build()\n    }\n    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {\n        if (intent?.action == \"pause\") {\n            if (task?.isCompleted == false && !mutable.value.stopping) {\n                mutable.value = mutable.value.copy(stopping = true, text = \"Stopping download…\")\n                val previous = task\n                previous?.cancel()\n                scope.launch {\n                    if (withTimeoutOrNull(3000L) { previous?.join(); true } != true && mutable.value.busy) {\n                        mutable.value = mutable.value.copy(timedOut = true, text = \"Native download still stopping. Reopen app settings if needed.\")\n                    }\n                }\n            }\n            return START_NOT_STICKY\n        }\n        if (task?.isCompleted == false) return START_NOT_STICKY\n        startForeground(notificationId, notification())\n        val model = selected\n        if (model == null || !mutable.value.busy) {\n            stopForeground(STOP_FOREGROUND_REMOVE)\n            stopSelf()\n            return START_NOT_STICKY\n        }\n        task = scope.launch(start = CoroutineStart.LAZY) {\n            var outcome = Status(name = model.displayName, text = \"Download interrupted; tap Download to retry.\", error = true)\n            var monitor: Job? = null\n            try {\n                wake = (getSystemService(Context.POWER_SERVICE) as PowerManager)\n                    .newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, \"tovarish:model_download\")\n                wake?.acquire(2 * 60 * 60 * 1000L)\n                if (ModelManagerWrapper.getPaths(model.modelName) != null) {\n                    outcome = Status(name = model.displayName, text = \"Model already downloaded.\")\n                    return@launch\n                }\n                val hub = runCatching { HubSource.valueOf(model.hub ?: \"AUTO\") }.getOrDefault(HubSource.AUTO)\n                val input = ModelPullInput(model_name = model.modelName, precision = model.quant, hub = hub,\n                    chipset = model.chipset, display_name = model.aiHubDisplayName)\n                val meter = DownloadMeter()\n                val started = SystemClock.elapsedRealtime()\n                val initialRx = android.net.TrafficStats.getUidRxBytes(android.os.Process.myUid())\n                var lastCallback = started\n                var sdkText = \"Waiting for SDK progress…\"\n                var percent: Int? = null\n                monitor = launch {\n                    while (true) {\n                        val now = SystemClock.elapsedRealtime()\n                        val rx = android.net.TrafficStats.getUidRxBytes(android.os.Process.myUid())\n                        val traffic = if (initialRx >= 0 && rx >= initialRx)\n                            String.format(java.util.Locale.US, \"%.1f MB app traffic\", (rx-initialRx)/1e6) else \"App traffic unavailable\"\n                        if (!mutable.value.stopping) {\n                            mutable.value = Status(busy = true, name = model.displayName, percent = percent,\n                                text = sdkText + \"\\n\" + traffic + \"\\nSDK update: \" + ((now-lastCallback)/1000) + \"s ago\")\n                            notifications.notify(notificationId, notification())\n                        }\n                        delay(1000)\n                    }\n                }\n                ModelManagerWrapper.pullFlow(input).collect { event ->\n                    when (event) {\n                        is ModelManagerWrapper.PullEvent.Progress -> {\n                            val done = event.files.sumOf { it.downloaded_bytes.coerceAtLeast(0L) }\n                            val total = if (event.files.isNotEmpty() && event.files.all { it.total_bytes > 0L })\n                                event.files.sumOf { it.total_bytes } else null\n                            val progress = meter.update(done, total, SystemClock.elapsedRealtime())\n                            sdkText = progress.text\n                            percent = progress.percent\n                            lastCallback = SystemClock.elapsedRealtime()\n                        }\n                        is ModelManagerWrapper.PullEvent.Completed -> {\n                            outcome = Status(name = model.displayName, text = \"Model downloaded.\")\n                        }\n                        is ModelManagerWrapper.PullEvent.Error -> {\n                            outcome = Status(name = model.displayName, text = \"Download failed (code \" + event.code + \"). Tap Download to retry.\", error = true)\n                        }\n                    }\n                }\n            } catch (e: CancellationException) {\n                outcome = Status(name = model.displayName, text = \"Download stopped. Tap Download to continue.\")\n                throw e\n            } catch (e: Exception) {\n                outcome = Status(name = model.displayName, text = \"Download failed: \" + e.javaClass.simpleName, error = true)\n            } finally {\n                monitor?.cancel()\n                wake?.let { if (it.isHeld) it.release() }\n                wake = null\n                mutable.value = outcome\n                stopForeground(STOP_FOREGROUND_REMOVE)\n                stopSelf()\n            }\n        }\n        task?.start()\n        return START_NOT_STICKY\n    }\n    override fun onDestroy() {\n        scope.cancel()\n        super.onDestroy()\n    }\n}\n")
+          PY
       - name: Build debug APK
         working-directory: upstream/geniex_chat_android
         run: gradle --no-daemon testDebugUnitTest assembleDebug
