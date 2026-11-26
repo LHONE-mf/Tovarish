@@ -777,28 +777,19 @@ jobs:
         working-directory: upstream/geniex_chat_android
         run: gradle --no-daemon testDebugUnitTest assembleDebug
       - name: Package test artifact and provenance
-        env:
-          TOVARISH_TEST_SIGNING_BUNDLE: ${{ secrets.TOVARISH_TEST_SIGNING_BUNDLE }}
         run: |
-          mkdir -p out
           set -euo pipefail
-          if [ -z "$TOVARISH_TEST_SIGNING_BUNDLE" ]; then
-            echo "::error::Permanent signing secret missing: TOVARISH_TEST_SIGNING_BUNDLE"
-            exit 1
-          fi
-          export TOVARISH_TEST_KEYSTORE_PASSWORD="${TOVARISH_TEST_SIGNING_BUNDLE%%:*}"
-          key_b64="${TOVARISH_TEST_SIGNING_BUNDLE#*:}"
-          echo "::add-mask::$TOVARISH_TEST_KEYSTORE_PASSWORD"
-          echo "::add-mask::$key_b64"
+          mkdir -p out
+          # This public development key is deliberately NOT a production signing key.
+          # The development package must never share an ID or certificate with production.
           umask 077
           keyfile="$(mktemp "$RUNNER_TEMP/tovarish-signing.XXXXXX")"
           trap 'rm -f "$keyfile"' EXIT
-          printf '%s' "$key_b64" | base64 --decode > "$keyfile"
-          unset key_b64 TOVARISH_TEST_SIGNING_BUNDLE
-          EXPECTED=31c3422756cf794fac9675d2ffbbc1f9c8b617d02875620516ccfa0042b1a657
-          ACTUAL=$(keytool -exportcert -keystore "$keyfile" -storetype PKCS12 -alias tovarish-test -storepass:env TOVARISH_TEST_KEYSTORE_PASSWORD | sha256sum | cut -d' ' -f1)
+          base64 --decode tovarish/.github/keys/tovarish-public-development.p12.b64 > "$keyfile"
+          EXPECTED=f6bac2653b36a419baa0fe5ab3fd5526bb958dd8ee8332c1ec0fe7ae1d0602bc
+          ACTUAL=$(keytool -exportcert -keystore "$keyfile" -storetype PKCS12 -alias tovarish-dev-public -storepass android | sha256sum | cut -d' ' -f1)
           test "$ACTUAL" = "$EXPECTED"
-          "$ANDROID_HOME/build-tools/34.0.0/apksigner" sign --ks "$keyfile" --ks-type PKCS12 --ks-key-alias tovarish-test --ks-pass env:TOVARISH_TEST_KEYSTORE_PASSWORD --key-pass env:TOVARISH_TEST_KEYSTORE_PASSWORD --out out/Tovarish-Test-debug.apk upstream/geniex_chat_android/build/outputs/apk/debug/app-debug.apk
+          "$ANDROID_HOME/build-tools/34.0.0/apksigner" sign --ks "$keyfile" --ks-type PKCS12 --ks-key-alias tovarish-dev-public --ks-pass pass:android --key-pass pass:android --out out/Tovarish-Test-debug.apk upstream/geniex_chat_android/build/outputs/apk/debug/app-debug.apk
           ACTUAL=$("$ANDROID_HOME/build-tools/34.0.0/apksigner" verify --print-certs out/Tovarish-Test-debug.apk | sed -n 's/^Signer #1 certificate SHA-256 digest: //p')
           test "$ACTUAL" = "$EXPECTED"
           rm -f out/*.idsig
@@ -806,6 +797,7 @@ jobs:
           git -C upstream rev-parse HEAD > out/upstream-commit.txt
           "$ANDROID_HOME/build-tools/34.0.0/aapt" dump badging out/Tovarish-Test-debug.apk > out/apk-info.txt
           grep -F "application-label:'Tovarish Dev'" out/apk-info.txt
+          grep -F "package: name='com.geniex.demo.tovarish.stabletest'" out/apk-info.txt
           "$ANDROID_HOME/build-tools/34.0.0/apksigner" verify --verbose --print-certs out/Tovarish-Test-debug.apk
           (cd out && sha256sum Tovarish-Test-debug.apk > SHA256SUMS.txt)
           du -h out/*
