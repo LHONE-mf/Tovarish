@@ -476,9 +476,34 @@ jobs:
           replace('        setListeners()\n    }', '''        setListeners()
                   val interrupted = getSharedPreferences("native_load", MODE_PRIVATE).getString("pending", null)
                   if (interrupted != null) {
+                      val report = buildString {
+                          append(interrupted)
+                          append("\\n\\nAndroid process exit history:")
+                          val manager = getSystemService(Context.ACTIVITY_SERVICE) as android.app.ActivityManager
+                          try {
+                              manager.getHistoricalProcessExitReasons(packageName, 0, 5).forEach { exit ->
+                                  val reason = when (exit.reason) {
+                                      android.app.ApplicationExitInfo.REASON_LOW_MEMORY -> "LOW_MEMORY"
+                                      android.app.ApplicationExitInfo.REASON_CRASH_NATIVE -> "CRASH_NATIVE"
+                                      android.app.ApplicationExitInfo.REASON_CRASH -> "CRASH"
+                                      android.app.ApplicationExitInfo.REASON_SIGNALED -> "SIGNALED"
+                                      android.app.ApplicationExitInfo.REASON_ANR -> "ANR"
+                                      else -> "reason=" + exit.reason
+                                  }
+                                  append("\\n" + java.util.Date(exit.timestamp) + " | " + reason + " | status=" + exit.status + " | PSS=" + exit.pss + " KiB | RSS=" + exit.rss + " KiB")
+                                  append("\\n" + (exit.description ?: "No description").take(400))
+                              }
+                          } catch (e: Exception) {
+                              append("\\nExit history unavailable: " + e.javaClass.simpleName)
+                          }
+                      }
                       AlertDialog.Builder(this)
                           .setTitle("Previous native load interrupted")
-                          .setMessage(interrupted + "\\nNPU loading is blocked for this model until a corrected build is installed. Other models remain available.")
+                          .setMessage(report + "\\n\\nNPU loading blocked pending diagnosis. CPU/GPU models remain available.")
+                          .setNeutralButton("Copy diagnostics") { _, _ ->
+                              val clipboard = getSystemService(Context.CLIPBOARD_SERVICE) as android.content.ClipboardManager
+                              clipboard.setPrimaryClip(android.content.ClipData.newPlainText("Tovarish NPU diagnostics", report))
+                          }
                           .setPositiveButton("OK", null)
                           .show()
                   }
@@ -492,8 +517,8 @@ jobs:
                               onLoadModelFailed("NPU chipset mismatch: "+chip)
                               return@launch
                           }
-                          if (loadPrefs.getString("pending_id", null) == selectModelData.id) {
-                              onLoadModelFailed("Previous native load was interrupted. Retry blocked in this build.")
+                          if (loadPrefs.getString("pending_id", null) != null) {
+                              onLoadModelFailed("A previous native NPU load was interrupted. NPU loading blocked pending diagnosis.")
                               return@launch
                           }
                           val manager = getSystemService(Context.ACTIVITY_SERVICE) as android.app.ActivityManager
@@ -505,7 +530,7 @@ jobs:
                               onLoadModelFailed("Android reports low memory; native load not started.")
                               return@launch
                           }
-                          if (!loadPrefs.edit().putString("pending_id", selectModelData.id).putString("pending", details).commit()) {
+                          if (!loadPrefs.edit().putString("pending_id", selectModelData.id).putString("pending", details + " | start=" + java.util.Date()).commit()) {
                               onLoadModelFailed("Cannot save native load diagnostic.")
                               return@launch
                           }
