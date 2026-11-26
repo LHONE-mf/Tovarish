@@ -1015,9 +1015,7 @@ jobs:
               @Volatile private var workerMemory = ""
               private var benchmarkRunning = false''')
           replace('binding.tvEngineStatus.text = requestedBackend + "\\n" + processMemory', 'binding.tvEngineStatus.text = requestedBackend + "\\nUI " + processMemory + if (workerMemory.isNotEmpty()) "\\n" + workerMemory else ""')
-          replace('requestedBackend = "No model loaded"\n', 'requestedBackend = "No model loaded"\n        workerMemory = ""\n')
-          replace('requestedBackend += " | " + result.getString("text").orEmpty()\n', 'requestedBackend += " | " + result.getString("text").orEmpty()\n')
-          replace('                              }\n                              if (isNativeNpu) loadPrefs.edit()', '                              }\n                              if (isNativeNpu) loadPrefs.edit()') if False else None
+          replace('        requestedBackend = "No model loaded"\n        isLoadLlmModel = false', '        requestedBackend = "No model loaded"\n        workerMemory = ""\n        isLoadLlmModel = false')
           # Callback indentation may vary because the upstream source is patched in earlier steps.
           marker = 'requestedBackend += " | " + result.getString("text").orEmpty()'
           i = s.index(marker) + len(marker)
