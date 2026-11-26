@@ -971,9 +971,9 @@ jobs:
                                   kotlinx.coroutines.withContext(Dispatchers.Main) { textInference.close() }
                                   handleUnloadResult(-1)
                               }''')
-          replace('                    llmWrapper.stopStream()', '''                    try { textInference.call(InferenceProtocol.STOP) }
+          replace('llmWrapper.stopStream()', '''                    try { textInference.call(InferenceProtocol.STOP) }
                               catch (e: Exception) { runOnUiThread { Toast.makeText(this@MainActivity, "Stop failed", Toast.LENGTH_SHORT).show() } }''')
-          replace('                llmWrapper.reset()', '''                try { textInference.call(InferenceProtocol.RESET) }
+          replace('llmWrapper.reset()', '''                try { textInference.call(InferenceProtocol.RESET) }
                           catch (e: Exception) {
                               kotlinx.coroutines.withContext(Dispatchers.Main) { textInference.close() }
                               onLoadModelFailed("History reset failed; reload model")
