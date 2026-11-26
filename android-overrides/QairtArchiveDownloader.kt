@@ -48,7 +48,7 @@ internal object QairtArchiveDownloader {
     private fun resolve(model: ModelData): Asset {
         val chip = requireNotNull(model.chipset)
         val manifest = json(BASE + "/manifest.json")
-        val platform = json(manifest.getString("platform_url"))
+        val platform = json(BASE + "/platform.json")
         val chips = platform.getJSONArray("chipsets")
         var canonical: String? = null
         for (i in 0 until chips.length()) {
