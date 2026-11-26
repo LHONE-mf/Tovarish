@@ -41,6 +41,16 @@ class TextInferenceService : Service() {
     @Volatile private var engine: LlmWrapper? = null
     @Volatile private var generating = false
     private val history = arrayListOf<ChatMessage>()
+    private fun memoryReport(): String {
+        val info = android.os.Debug.MemoryInfo()
+        android.os.Debug.getMemoryInfo(info)
+        val values = runCatching {
+            java.io.File("/proc/self/status").readLines().filter {
+                it.startsWith("VmRSS:") || it.startsWith("VmHWM:")
+            }.associate { it.substringBefore(':') to it.substringAfter(':').trim().substringBefore(' ').toLong() }
+        }.getOrDefault(emptyMap())
+        return "Worker PSS ${info.totalPss / 1024} MiB | RSS ${values["VmRSS"]?.div(1024) ?: "?"} MiB | RSS lifetime peak ${values["VmHWM"]?.div(1024) ?: "?"} MiB"
+    }
     private val receiver = Messenger(Handler(Looper.getMainLooper()) { msg ->
         val op = msg.what
         val id = msg.arg1
@@ -79,6 +89,7 @@ class TextInferenceService : Service() {
                                 compute_unit = requireNotNull(args.getString("device")))).build().getOrThrow()
                             history.clear()
                             send("loaded", runtime + " | worker PID " + android.os.Process.myPid())
+                            send("memory", memoryReport())
                         }
                         InferenceProtocol.GENERATE -> {
                             val current = checkNotNull(engine) { "No model loaded" }
@@ -93,7 +104,7 @@ class TextInferenceService : Service() {
                                 val formatted = current.applyChatTemplate(history.toTypedArray(), null,
                                     args.getBoolean("thinking")).getOrThrow()
                                 current.generateStreamFlow(formatted.formattedText,
-                                    GenerationConfigSample().toGenerationConfig()).collect { event ->
+                                    GenerationConfigSample(maxTokens = args.getInt("maxTokens", 2048).coerceIn(1, 2048)).toGenerationConfig()).collect { event ->
                                     when (event) {
                                         is LlmStreamResult.Token -> {
                                             output.append(event.text)
@@ -111,6 +122,7 @@ class TextInferenceService : Service() {
                                     }
                                 }
                                 check(completed) { "Generation stopped before completion" }
+                                send("memory", memoryReport())
                             } finally {
                                 generating = false
                                 if (!completed) {
@@ -208,8 +220,13 @@ internal class TextInferenceClient(private val context: Context, private val onL
     }
     suspend fun call(op: Int, args: Bundle = Bundle(), event: (Bundle) -> Unit = {}) =
         withContext(Dispatchers.Main.immediate) {
-            val target = if (op == InferenceProtocol.LOAD) connect()
+            val target = try {
+                if (op == InferenceProtocol.LOAD) connect()
                 else checkNotNull(remote) { "Inference process not connected" }
+            } catch (e: Exception) {
+                lost()
+                throw e
+            }
             val id = ++nextId
             val responses = Channel<Bundle>(Channel.UNLIMITED)
             pending[id] = responses
