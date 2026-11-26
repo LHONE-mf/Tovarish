@@ -871,6 +871,135 @@ jobs:
           assert x.count('versionCode 1') == 1
           p.write_text(x.replace('versionCode 1', 'versionCode 2').replace("versionName '1.0'", "versionName '1.1-dev'"))
           PY
+      - name: Route text inference through a private worker process
+        working-directory: upstream/geniex_chat_android
+        run: |
+          cp ../../tovarish/android-overrides/TextInferenceService.kt src/main/java/com/geniex/demo/
+          python - <<'PY'
+          from pathlib import Path
+          p = Path('src/main/java/com/geniex/demo/MainActivity.kt')
+          s = p.read_text()
+          def replace(old, new):
+              global s
+              assert s.count(old) == 1, old
+              s = s.replace(old, new)
+          replace('private lateinit var llmWrapper: LlmWrapper', '''private val textInference by lazy {
+                  TextInferenceClient(this) {
+                      if (!isDestroyed && !isFinishing) {
+                          resetLoadState()
+                          isGenerating = false
+                          removeLoadingIndicator()
+                          vTip.visibility = View.GONE
+                          llLoading.visibility = View.GONE
+                          btnUnloadModel.visibility = View.GONE
+                          btnStop.visibility = View.GONE
+                          btnAddImage.visibility = View.INVISIBLE
+                          requestedBackend = "Inference worker disconnected"
+                          messages.add(Message("Inference worker stopped. No automatic restart.", MessageType.PROFILE))
+                          reloadRecycleView()
+                          refreshSendButtonState()
+                      }
+                  }
+              }''')
+          start = s.index('                    LlmWrapper\n')
+          end = s.index('\n                "multimodal", "vlm" ->', start)
+          s = s[:start] + '''                    try {
+                              val request = Bundle().apply {
+                                  putString("model", selectModelData.modelName)
+                                  putString("runtime", pluginId)
+                                  putString("device", resolvedDeviceId ?: ComputeUnitValue.NPU.value)
+                                  putInt("context", contextTokens)
+                                  putInt("layers", nGpuLayers)
+                                  putBoolean("thinking", enableThinking)
+                              }
+                              textInference.call(InferenceProtocol.LOAD, request) { result ->
+                                  if (result.getString("kind") == "loaded") {
+                                      requestedBackend += " | " + result.getString("text").orEmpty()
+                                  }
+                              }
+                              if (isNativeNpu) loadPrefs.edit().remove("pending_id").remove("pending").commit()
+                              isLoadLlmModel = true
+                              onLoadModelSuccess("Text model loaded in inference worker")
+                          } catch (e: Exception) {
+                              kotlinx.coroutines.withContext(Dispatchers.Main) { textInference.close() }
+                              onLoadModelFailed(e.message ?: "Inference worker load failed")
+                          }
+                      }
+
+          '''.rstrip() + '\n' + s[end:]
+          # The local text configuration is now constructed exclusively by the worker.
+          start = s.index('                    val isQairt = pluginId == "qairt"')
+          end = s.index('                    try {', start)
+          s = s[:start] + s[end:]
+          start = s.index('                        chatList.add(ChatMessage(role = "user", inputString))')
+          end = s.index('\n                    }\n\n                    clearImages()', start)
+          s = s[:start] + '''                        try {
+                                  textInference.call(InferenceProtocol.GENERATE, Bundle().apply {
+                                      putString("prompt", inputString)
+                                      putBoolean("thinking", enableThinking)
+                                  }) { result ->
+                                      when (result.getString("kind")) {
+                                          "token" -> {
+                                              removeLoadingIndicator()
+                                              sb.append(result.getString("text").orEmpty())
+                                              val msg = Message(sb.toString(), MessageType.ASSISTANT)
+                                              if (messages.lastOrNull()?.type == MessageType.ASSISTANT)
+                                                  messages[messages.lastIndex] = msg
+                                              else messages.add(msg)
+                                              adapter.notifyDataSetChanged()
+                                          }
+                                          "profile" -> {
+                                              messages.add(Message(result.getString("text").orEmpty(), MessageType.PROFILE))
+                                              reloadRecycleView()
+                                          }
+                                      }
+                                  }
+                              } catch (e: Exception) {
+                                  runOnUiThread {
+                                      removeLoadingIndicator()
+                                      messages.add(Message("Inference: " + (e.message ?: "failed"), MessageType.PROFILE))
+                                      reloadRecycleView()
+                                  }
+                              }''' + s[end:]
+          replace('''                    llmWrapper.stopStream()
+                              llmWrapper.destroy()
+                              chatList.clear()
+                              handleUnloadResult(0)'''.replace('\n          ', '\n'), '''                    try {
+                                  textInference.call(InferenceProtocol.UNLOAD)
+                                  handleUnloadResult(0)
+                              } catch (e: Exception) {
+                                  kotlinx.coroutines.withContext(Dispatchers.Main) { textInference.close() }
+                                  handleUnloadResult(-1)
+                              }''')
+          replace('                    llmWrapper.stopStream()', '''                    try { textInference.call(InferenceProtocol.STOP) }
+                              catch (e: Exception) { runOnUiThread { Toast.makeText(this@MainActivity, "Stop failed", Toast.LENGTH_SHORT).show() } }''')
+          replace('                llmWrapper.reset()', '''                try { textInference.call(InferenceProtocol.RESET) }
+                          catch (e: Exception) {
+                              kotlinx.coroutines.withContext(Dispatchers.Main) { textInference.close() }
+                              onLoadModelFailed("History reset failed; reload model")
+                          } finally {
+                              isGenerating = false
+                              refreshSendButtonState()
+                          }''')
+          replace('    private fun clearHistory() {\n', '    private fun clearHistory() {\n        if (isGenerating || llLoading.visibility == View.VISIBLE) return\n        if (isLoadLlmModel) { isGenerating = true; refreshSendButtonState() }\n')
+          replace('        btnUnloadModel.setOnClickListener {\n', '        btnUnloadModel.setOnClickListener {\n            if (isGenerating) {\n                Toast.makeText(this, "Stop generation before unloading.", Toast.LENGTH_SHORT).show()\n                return@setOnClickListener\n            }\n')
+          replace('    override fun onDestroy() {', '    override fun onDestroy() {\n        textInference.close()')
+          assert 'llmWrapper.' not in s, 'Local LLM call remained'
+          p.write_text(s)
+          p = Path('src/main/AndroidManifest.xml')
+          s = p.read_text()
+          marker = '        <activity\n            android:name=".MainActivity"'
+          assert s.count(marker) == 1
+          p.write_text(s.replace(marker, '''        <service
+                      android:name=".TextInferenceService"
+                      android:process=":inference"
+                      android:exported="false" />
+          ''' + marker))
+          p = Path('build.gradle')
+          s = p.read_text()
+          assert s.count('versionCode 2') == 1
+          p.write_text(s.replace('versionCode 2', 'versionCode 3').replace("versionName '1.1-dev'", "versionName '1.2-dev'"))
+          PY
       - name: Build debug APK
         working-directory: upstream/geniex_chat_android
         run: gradle --no-daemon testDebugUnitTest assembleDebug
