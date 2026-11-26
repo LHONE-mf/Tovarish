@@ -627,6 +627,7 @@ jobs:
         working-directory: upstream/geniex_chat_android
         run: |
           cp ../../tovarish/android-overrides/QairtArchiveDownloader.kt src/main/java/com/geniex/demo/
+          cp ../../tovarish/android-overrides/QairtArchiveDownloaderTest.kt src/test/java/com/geniex/demo/
           python - <<'PY'
           from pathlib import Path
           p = Path('src/main/java/com/geniex/demo/ModelDownloadService.kt')
@@ -651,6 +652,7 @@ jobs:
                       ModelPullInput(model_name = model.modelName, precision = model.quant, hub = hub,
                           chipset = model.chipset, display_name = model.aiHubDisplayName)
                   }''')
+          replace('text = "Download failed: " + e.javaClass.simpleName, error = true)', 'text = "Download failed: " + (e.message ?: e.javaClass.simpleName).take(240), error = true)')
           replace('var sdkText = "Waiting for SDK progress…"', 'var sdkText = if (isQairt) "Importing verified archive into GenieX…" else "Waiting for SDK progress…"')
           replace('sdkText = progress.text', 'sdkText = (if (isQairt) "Importing verified archive\\n" else "") + progress.text')
           replace('outcome = Status(name = model.displayName, text = "Model downloaded.")', '''if (ModelManagerWrapper.getPaths(model.modelName) == null) {
