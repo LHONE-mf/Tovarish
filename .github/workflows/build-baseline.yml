@@ -682,6 +682,8 @@ jobs:
           grep -F "application-label:'Tovarish Test'" out/apk-info.txt
           "$ANDROID_HOME/build-tools/34.0.0/apksigner" verify --verbose --print-certs out/Tovarish-Test-debug.apk
           (cd out && sha256sum Tovarish-Test-debug.apk > SHA256SUMS.txt)
+          du -h out/*
+          echo "APK bytes: $(stat -c %s out/Tovarish-Test-debug.apk)" >> "$GITHUB_STEP_SUMMARY"
       - uses: actions/upload-artifact@v4
         id: artifact
         continue-on-error: true
@@ -692,7 +694,7 @@ jobs:
           retention-days: 7
           compression-level: 0
       - name: Save private draft release if artifact upload fails
-        if: steps.artifact.outcome == 'failure'
+        if: steps.artifact.outcome == 'failure' && github.event.repository.private == true
         env:
           GH_TOKEN: ${{ github.token }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
@@ -711,3 +713,11 @@ jobs:
           print(r['url'])
           PY
           echo "Private draft download: $(gh release view "$tag" --repo "$GITHUB_REPOSITORY" --json url --jq .url)" >> "$GITHUB_STEP_SUMMARY"
+      - name: Require successful artifact upload for public repository
+        if: steps.artifact.outcome == 'failure' && github.event.repository.private == false
+        run: |
+          echo "::error::Public Actions artifact upload failed; inspect quota and upload logs."
+          exit 1
+      - name: Report artifact link
+        if: steps.artifact.outcome == 'success'
+        run: echo "APK artifact available in this workflow run." >> "$GITHUB_STEP_SUMMARY"
