@@ -961,10 +961,7 @@ jobs:
                                       reloadRecycleView()
                                   }
                               }''' + s[end:]
-          replace('''                    llmWrapper.stopStream()
-                              llmWrapper.destroy()
-                              chatList.clear()
-                              handleUnloadResult(0)'''.replace('\n          ', '\n'), '''                    try {
+          replace('llmWrapper.stopStream()\n                    llmWrapper.destroy()\n                    chatList.clear()\n                    handleUnloadResult(0)', '''                    try {
                                   textInference.call(InferenceProtocol.UNLOAD)
                                   handleUnloadResult(0)
                               } catch (e: Exception) {
