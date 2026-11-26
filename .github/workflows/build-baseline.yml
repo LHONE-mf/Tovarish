@@ -773,6 +773,104 @@ jobs:
           assert x.count('Tovarish Test') == 1
           p.write_text(x.replace('Tovarish Test', 'Tovarish Dev'))
           PY
+      - name: Add process memory telemetry and bounded GGUF context selection
+        working-directory: upstream/geniex_chat_android
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          p = Path('src/main/java/com/geniex/demo/MainActivity.kt')
+          s = p.read_text()
+          def replace(old, new):
+              global s
+              assert s.count(old) == 1, old
+              s = s.replace(old, new)
+          replace('private var ramObserver: Job? = null', '''private var ramObserver: Job? = null
+              @Volatile private var requestedBackend = "No model loaded"
+              private var peakPssKiB = 0L
+              private var memorySample = 0
+              private var processMemory = "Sampling process memory..."
+              ''')
+          replace('                          kotlinx.coroutines.delay(2000)', '''                          if (memorySample++ % 2 == 0) {
+                                  processMemory = kotlinx.coroutines.withContext(Dispatchers.IO) {
+                                      val info = android.os.Debug.MemoryInfo()
+                                      android.os.Debug.getMemoryInfo(info)
+                                      val pss = info.totalPss.toLong()
+                                      val values = runCatching {
+                                          File("/proc/self/status").readLines().mapNotNull { line ->
+                                              val key = line.substringBefore(':')
+                                              if (key == "VmRSS" || key == "VmHWM")
+                                                  key to line.substringAfter(':').trim().substringBefore(' ').toLongOrNull()
+                                              else null
+                                          }.toMap()
+                                      }.getOrDefault(emptyMap())
+                                      peakPssKiB = maxOf(peakPssKiB, pss)
+                                      fun mib(value: Long?): String = value?.let { String.format(Locale.US, "%.0f", it / 1024.0) } ?: "?"
+                                      "Process PSS " + mib(pss) + " MiB (sampled peak " + mib(peakPssKiB) + ") | RSS " + mib(values["VmRSS"]) + " MiB (peak " + mib(values["VmHWM"]) + ")"
+                                  }
+                              }
+                              binding.tvEngineStatus.text = requestedBackend + "\\n" + processMemory
+                              kotlinx.coroutines.delay(2000)''')
+          replace('        deviceId: String? = null,\n    ) {', '        deviceId: String? = null,\n        contextTokens: Int = 1024,\n    ) {')
+          replace('            val resolvedDeviceId = deviceId', '''            val resolvedDeviceId = deviceId
+                      val requested = when (resolvedDeviceId) {
+                          ComputeUnitValue.CPU.value -> "CPU"
+                          ComputeUnitValue.GPU.value -> "GPU"
+                          ComputeUnitValue.NPU.value -> "NPU"
+                          else -> if (pluginId == "qairt") "NPU" else "default"
+                      }
+                      requestedBackend = "Requested: " + requested + " | runtime: " + pluginId + " | actual placement unverified"''')
+          replace('                                nCtx = 1024,', '                                nCtx = contextTokens,')
+          replace('        isLoadLlmModel = false\n        isLoadVlmModel = false', '        requestedBackend = "No model loaded"\n        isLoadLlmModel = false\n        isLoadVlmModel = false')
+          replace('    private fun onLoadModelFailed(tip: String) {\n', '    private fun onLoadModelFailed(tip: String) {\n        requestedBackend = "Load failed"\n')
+          replace('            supportPluginIds.forEach {', '''            val contextOptions = listOf(512, 1024, 2048)
+                      dialogBinding.llContext.visibility = if (isGgufLlmModel) View.VISIBLE else View.GONE
+                      dialogBinding.spContext.adapter = android.widget.ArrayAdapter(
+                          this, android.R.layout.simple_spinner_dropdown_item, contextOptions.map { it.toString() })
+                      dialogBinding.spContext.setSelection(1)
+                      supportPluginIds.forEach {''')
+          replace('                                loadModel(selectModelData, modelDataPluginId, nGpuLayers, ggufLlmDeviceId)', '''                                val context = if (isGgufLlmModel) contextOptions[dialogBinding.spContext.selectedItemPosition.coerceIn(0, 2)] else 1024
+                                          loadModel(selectModelData, modelDataPluginId, nGpuLayers, ggufLlmDeviceId, context)''')
+          p.write_text(s)
+          p = Path('src/main/res/layout/activity_main.xml')
+          x = p.read_text()
+          marker = '        <!-- Control buttons section -->'
+          assert x.count(marker) == 1
+          p.write_text(x.replace(marker, '''        <TextView
+                      android:id="@+id/tv_engine_status"
+                      android:layout_width="match_parent"
+                      android:layout_height="wrap_content"
+                      android:paddingStart="16dp"
+                      android:paddingEnd="16dp"
+                      android:textColor="#F2F2F3"
+                      android:textSize="11sp" />
+
+          ''' + marker))
+          p = Path('src/main/res/layout/dialog_select_plugin_id.xml')
+          x = p.read_text()
+          marker = '    <LinearLayout\n        android:id="@+id/ll_gpu_layers"'
+          assert x.count(marker) == 1
+          p.write_text(x.replace(marker, '''    <LinearLayout
+                  android:id="@+id/ll_context"
+                  android:layout_width="match_parent"
+                  android:layout_height="wrap_content"
+                  android:orientation="horizontal"
+                  android:visibility="gone">
+                  <TextView
+                      android:layout_width="wrap_content"
+                      android:layout_height="wrap_content"
+                      android:text="Context tokens: " />
+                  <Spinner
+                      android:id="@+id/sp_context"
+                      android:layout_width="wrap_content"
+                      android:layout_height="wrap_content" />
+              </LinearLayout>
+
+          ''' + marker))
+          p = Path('build.gradle')
+          x = p.read_text()
+          assert x.count('versionCode 1') == 1
+          p.write_text(x.replace('versionCode 1', 'versionCode 2').replace("versionName '1.0'", "versionName '1.1-dev'"))
+          PY
       - name: Build debug APK
         working-directory: upstream/geniex_chat_android
         run: gradle --no-daemon testDebugUnitTest assembleDebug
