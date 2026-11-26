@@ -694,17 +694,109 @@ jobs:
           s = s.replace(old, 'model.copy(chipset = chipset, modelName = "tovarish-" + chipset.lowercase(Locale.US) + "/" + model.id, displayName = model.displayName + " · " + chipset)')
           p.write_text(s)
           PY
+      - name: Add foreground memory monitor and guarded NPU preflight
+        working-directory: upstream/geniex_chat_android
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          p = Path('src/main/java/com/geniex/demo/MainActivity.kt')
+          s = p.read_text()
+          def replace(old, new):
+              global s
+              assert s.count(old) == 1, old
+              s = s.replace(old, new)
+          replace('private var downloadObserver: Job? = null', '''private var downloadObserver: Job? = null
+              private var ramObserver: Job? = null''')
+          replace('    override fun onDestroy() {', '''    override fun onStart() {
+                  super.onStart()
+                  ramObserver?.cancel()
+                  ramObserver = modelScope.launch(Dispatchers.Main) {
+                      val manager = getSystemService(Context.ACTIVITY_SERVICE) as android.app.ActivityManager
+                      while (true) {
+                          val memory = android.app.ActivityManager.MemoryInfo()
+                          manager.getMemoryInfo(memory)
+                          val available = memory.availMem / 1073741824.0
+                          val total = memory.totalMem / 1073741824.0
+                          val selected = modelList.firstOrNull { it.id == selectModelId }
+                          val npu = selected?.runtime == "qairt"
+                          val suffix = if (npu) " | NPU preflight floor: 5 GiB (provisional)" else ""
+                          binding.tvRamStatus.text = String.format(Locale.US, "RAM: %.2f / %.2f GiB available", available, total) + suffix
+                          binding.tvRamStatus.setTextColor(android.graphics.Color.parseColor(
+                              if (memory.lowMemory || (npu && available < 5.0)) "#FFB86C" else "#F2F2F3"))
+                          kotlinx.coroutines.delay(2000)
+                      }
+                  }
+              }
+
+              override fun onStop() {
+                  ramObserver?.cancel()
+                  ramObserver = null
+                  super.onStop()
+              }
+
+              override fun onDestroy() {''')
+          replace('if (memory.lowMemory) {\n', '''val modelFile = File(paths.model_path)
+                          val modelFolder = if (modelFile.isDirectory) modelFile else modelFile.parentFile
+                          val weights = modelFolder?.listFiles()?.filter { it.isFile && it.name.endsWith(".bin", true) }?.sumOf { it.length() } ?: 0L
+                          val minimum = maxOf(5L * 1073741824L, weights + 1610612736L, memory.threshold + 1073741824L)
+                          if (memory.availMem < minimum) {
+                              onLoadModelFailed(String.format(Locale.US, "NPU load blocked: %.2f GiB available; provisional minimum %.2f GiB. Actual runtime requirement is not yet verified.", memory.availMem / 1073741824.0, minimum / 1073741824.0))
+                              return@launch
+                          }
+                          if (memory.lowMemory) {
+          '''.rstrip() + '\n')
+          p.write_text(s)
+          p = Path('src/main/res/layout/activity_main.xml')
+          x = p.read_text()
+          marker = '        <!-- Control buttons section -->'
+          assert x.count(marker) == 1
+          p.write_text(x.replace(marker, '''        <TextView
+                      android:id="@+id/tv_ram_status"
+                      android:layout_width="match_parent"
+                      android:layout_height="wrap_content"
+                      android:paddingStart="16dp"
+                      android:paddingEnd="16dp"
+                      android:paddingTop="4dp"
+                      android:paddingBottom="4dp"
+                      android:textColor="#F2F2F3"
+                      android:textSize="12sp" />
+
+          ''' + marker))
+          # A new package keeps the old diagnostic installation and its private data intact.
+          p = Path('build.gradle')
+          x = p.read_text()
+          old = "applicationId 'com.geniex.demo.tovarish.chipsettest'"
+          assert x.count(old) == 1
+          p.write_text(x.replace(old, "applicationId 'com.geniex.demo.tovarish.stabletest'"))
+          p = Path('src/main/res/values/strings.xml')
+          x = p.read_text()
+          assert x.count('Tovarish Test') == 1
+          p.write_text(x.replace('Tovarish Test', 'Tovarish Dev'))
+          PY
       - name: Build debug APK
         working-directory: upstream/geniex_chat_android
         run: gradle --no-daemon testDebugUnitTest assembleDebug
       - name: Package test artifact and provenance
+        env:
+          TOVARISH_TEST_KEYSTORE_B64: ${{ secrets.TOVARISH_TEST_KEYSTORE_B64 }}
+          TOVARISH_TEST_KEYSTORE_PASSWORD: ${{ secrets.TOVARISH_TEST_KEYSTORE_PASSWORD }}
         run: |
           mkdir -p out
-          cp upstream/geniex_chat_android/build/outputs/apk/debug/app-debug.apk out/Tovarish-Test-debug.apk
+          set -euo pipefail
+          if [ -z "$TOVARISH_TEST_KEYSTORE_B64" ] || [ -z "$TOVARISH_TEST_KEYSTORE_PASSWORD" ]; then
+            echo "::error::Permanent test signing key missing. Configure repository Actions secrets before publishing an APK."
+            exit 1
+          fi
+          umask 077
+          keyfile="$(mktemp "$RUNNER_TEMP/tovarish-signing.XXXXXX")"
+          trap 'rm -f "$keyfile"' EXIT
+          printf '%s' "$TOVARISH_TEST_KEYSTORE_B64" | base64 --decode > "$keyfile"
+          "$ANDROID_HOME/build-tools/34.0.0/apksigner" sign --ks "$keyfile" --ks-type PKCS12 --ks-key-alias tovarish-test --ks-pass env:TOVARISH_TEST_KEYSTORE_PASSWORD --key-pass env:TOVARISH_TEST_KEYSTORE_PASSWORD --out out/Tovarish-Test-debug.apk upstream/geniex_chat_android/build/outputs/apk/debug/app-debug.apk
+          rm -f out/*.idsig
           cp upstream/LICENSE out/QUALCOMM-LICENSE.txt
           git -C upstream rev-parse HEAD > out/upstream-commit.txt
           "$ANDROID_HOME/build-tools/34.0.0/aapt" dump badging out/Tovarish-Test-debug.apk > out/apk-info.txt
-          grep -F "application-label:'Tovarish Test'" out/apk-info.txt
+          grep -F "application-label:'Tovarish Dev'" out/apk-info.txt
           "$ANDROID_HOME/build-tools/34.0.0/apksigner" verify --verbose --print-certs out/Tovarish-Test-debug.apk
           (cd out && sha256sum Tovarish-Test-debug.apk > SHA256SUMS.txt)
           du -h out/*
