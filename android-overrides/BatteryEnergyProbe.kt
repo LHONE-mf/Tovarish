@@ -53,6 +53,19 @@ internal class BatteryEnergyProbe(context: Context) {
     }
 }
 
+// Only accept the two known unit hypotheses when corroborated by a sufficiently
+// large independent charge-counter change. Do not fit an arbitrary multiplier.
+internal fun inferCurrentScale(nominalJ: Double?, chargeJ: Double?, chargeDropUah: Int?, changes: Int): Double? {
+    if (nominalJ == null || chargeJ == null || chargeDropUah == null ||
+        nominalJ <= 0 || chargeJ <= 0 || chargeDropUah < 8000 || changes < 2) return null
+    val ratio = chargeJ / nominalJ
+    return when (ratio) {
+        in 0.5..2.0 -> 1.0
+        in 500.0..2000.0 -> 1000.0
+        else -> null
+    }
+}
+
 internal class EnergyWindow {
     private var last: EnergySample? = null
     private var joules = 0.0
@@ -71,11 +84,13 @@ internal class EnergyWindow {
     private var invalidCurrent = 0
     private var dischargeCount = 0
     private var count = 0
+    private var currentChanges = 0
     fun add(s: EnergySample) {
         if (first == null) first = s
         count++
         if (s.discharging) dischargeCount++
         s.currentUa?.let {
+            if (last?.currentUa != null && last?.currentUa != it) currentChanges++
             minUa = minOf(minUa ?: it, it)
             maxUa = maxOf(maxUa ?: it, it)
             when {
@@ -107,36 +122,49 @@ internal class EnergyWindow {
     val averageWatts: Double? get() = if (usable) joules / (validMs / 1000.0) else null
     // Scale the observed mean to the window; at most 10% of time can be missing.
     val estimatedJoules: Double? get() = averageWatts?.times(seconds)
-    fun report(tokens: Int = 0): String {
+    private val chargeDropUah: Int? get() {
+        val a = first?.chargeUah ?: return null
+        val b = last?.chargeUah ?: return null
+        return if (a > 0 && b > 0 && a > b && dischargeCount == count) a - b else null
+    }
+    private val chargeJ: Double? get() {
+        val drop = chargeDropUah ?: return null
+        val a = first?.voltageMv ?: return null
+        val b = last?.voltageMv ?: return null
+        return if (a in 2500..10000 && b in 2500..10000) drop.toDouble() * (a + b) * 1.8e-6 else null
+    }
+    fun inferredScale(): Double? = inferCurrentScale(estimatedJoules, chargeJ, chargeDropUah, currentChanges)
+    fun report(tokens: Int = 0, scale: Double? = null): String {
         fun fmt(v: Double?) = v?.let { String.format(Locale.US, "%.3f", it) } ?: "unavailable"
         val start = first
         val end = last
         val energyDelta = if (start?.energyNwh != null && end?.energyNwh != null &&
             start.energyNwh > 0 && end.energyNwh > 0 && start.energyNwh > end.energyNwh &&
             dischargeCount == count) (start.energyNwh - end.energyNwh) * 0.0000036 else null
-        val chargeDelta = if (start?.chargeUah != null && end?.chargeUah != null &&
-            start.chargeUah > 0 && end.chargeUah > 0 && start.chargeUah > end.chargeUah &&
-            start.voltageMv != null && end.voltageMv != null &&
-            start.voltageMv in 2500..10000 && end.voltageMv in 2500..10000 &&
-            dischargeCount == count) (start.chargeUah - end.chargeUah).toDouble() *
-            (start.voltageMv + end.voltageMv) * 1.8e-6 else null
+        val chargeDelta = chargeJ
+        val calibratedW = if (scale != null && currentChanges >= 2) averageWatts?.times(scale) else null
+        val calibratedJ = calibratedW?.times(seconds)
         val sign = when {
             positive > 0 && negative > 0 -> "mixed; integration rejected"
             positive > 0 -> "positive discharge (vendor sign, unverified magnitude)"
             negative > 0 -> "negative discharge (Android convention)"
             else -> "no nonzero current"
         }
-        return "Raw current uA: " + minUa + ".." + maxUa + " | average endpoint uA: " + end?.averageUa +
+        return "Raw current (API claims uA): " + minUa + ".." + maxUa + " | average endpoint uA: " + end?.averageUa +
             " | voltage mV: " + minMv + ".." + maxMv + " | sign: " + sign +
-            " | zero/unsupported: " + invalidCurrent + " | discharging status: " + dischargeCount + "/" + count +
+            " | current value changes: " + currentChanges + " | zero/unsupported: " + invalidCurrent + " | discharging status: " + dischargeCount + "/" + count +
             "\nCharge counter uAh: " + start?.chargeUah + " -> " + end?.chargeUah +
             " | energy counter nWh: " + start?.energyNwh + " -> " + end?.energyNwh +
             "\nCounter estimates (coarse; not substitutes for integration): energy J " + fmt(energyDelta) +
             " | charge x voltage J " + fmt(chargeDelta) + "\n" +
             "Duration: " + fmt(seconds) + " s | valid coverage: " + fmt(coverage * 100) +
-            "% | samples: " + validCount + "\nGross device W: " + fmt(averageWatts) +
-            " | estimated J: " + fmt(estimatedJoules) +
-            (if (tokens > 0) " | gross J/token: " + fmt(estimatedJoules?.div(tokens)) else "") +
+            "% | samples: " + validCount + "\nNominal API W: " + fmt(averageWatts) +
+            " | nominal API J: " + fmt(estimatedJoules) +
+            "\nValidated unit hypothesis multiplier: " + fmt(scale) +
+            " | estimated whole-device W: " + fmt(calibratedW) +
+            " | estimated J: " + fmt(calibratedJ) +
+            (if (tokens > 0) " | estimated gross J/token: " + fmt(calibratedJ?.div(tokens)) else "") +
+            (if (scale != null && currentChanges < 2) "\nCurrent refresh insufficient; estimate withheld." else "") +
             "\nBattery peak C: " + fmt(peakTemp) + " | max thermal status: " + thermal
     }
 }
