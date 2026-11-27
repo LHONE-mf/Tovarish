@@ -1,0 +1,1559 @@
+name: Build Tovarish baseline APK
+on:
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  build:
+    if: github.event_name == 'workflow_dispatch' || (github.event.pull_request.head.repo.full_name == github.repository && github.head_ref == 'build/geniex-baseline')
+    permissions:
+      contents: write
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: qualcomm/ai-hub-apps
+          ref: e6477cfa238acaffe01ed45de4cfcbd53abbc99d
+          path: upstream
+          persist-credentials: false
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.13'
+      - uses: android-actions/setup-android@v3
+        with:
+          packages: 'platform-tools'
+      - name: Install Android SDK components
+        run: sdkmanager 'platforms;android-34' 'build-tools;34.0.0' 'ndk;27.3.13750724'
+      - name: Rename launcher label
+        working-directory: upstream/geniex_chat_android
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          p = Path('src/main/res/values/strings.xml')
+          s = p.read_text()
+          old = '<string name="app_name">GenieXDemo</string>'
+          assert s.count(old) == 1, 'Unexpected upstream app label'
+          p.write_text(s.replace(old, '<string name="app_name">Tovarish</string>'))
+          PY
+      - name: Add download diagnostics to isolated test app
+        working-directory: upstream/geniex_chat_android
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          def replace(p, old, new):
+              s = p.read_text()
+              assert s.count(old) == 1, f'Unexpected upstream source: {p}'
+              p.write_text(s.replace(old, new))
+          p = Path('src/main/java/com/geniex/demo/MainActivity.kt')
+          replace(p, '        tvDownloadProgress.text = "0%"\n\n        val hub =', '''        tvDownloadProgress.text = "Connecting to model server…"
+                  pbDownloading.isIndeterminate = true
+                  val meter = DownloadMeter()
+
+                  val hub ='''.replace('\n                  ', '\n        '))
+          old = '''                                val total = event.files.sumOf { if (it.total_bytes > 0) it.total_bytes else 0L }
+                                          val done = event.files.sumOf { it.downloaded_bytes }
+                                          val percent = if (total > 0) ((done * 100) / total).toInt() else 0
+                                          runOnUiThread { tvDownloadProgress.text = "$percent%" }'''
+          # Match indentation exactly from pinned upstream.
+          old = '\n'.join([old.splitlines()[0]] + ['                                '+line.strip() for line in old.splitlines()[1:]])
+          new = '''                                val done = event.files.sumOf { it.downloaded_bytes.coerceAtLeast(0L) }
+                                          val known = event.files.isNotEmpty() && event.files.all { it.total_bytes > 0L }
+                                          val total = if (known) event.files.sumOf { it.total_bytes } else null
+                                          val progress = meter.update(done, total, android.os.SystemClock.elapsedRealtime())
+                                          runOnUiThread {
+                                              tvDownloadProgress.text = progress.text
+                                              pbDownloading.isIndeterminate = progress.percent == null
+                                              progress.percent?.let { pbDownloading.progress = it }
+                                          }'''
+          new = '\n'.join([new.splitlines()[0]] + [line[10:] for line in new.splitlines()[1:]])
+          replace(p, old, new)
+          replace(p, '"Download failed. Please check your network connection and try again.",', '"Download failed (code \u0024{event.code}). Retry or check the network and free storage.",')
+          replace(p, '                    }\n                } finally {\n                    if (wakeLock.isHeld) wakeLock.release()', '''                    }
+                          } catch (e: kotlinx.coroutines.CancellationException) {
+                              throw e
+                          } catch (e: Exception) {
+                              Log.e(TAG, "Model download failed", e)
+                              runOnUiThread {
+                                  llDownloading.visibility = View.GONE
+                                  Toast.makeText(this@MainActivity, "Download failed: \u0024{e.javaClass.simpleName}", Toast.LENGTH_LONG).show()
+                              }
+                          } finally {
+                              if (wakeLock.isHeld) wakeLock.release()'''.replace('\n          ', '\n'))
+          replace(Path('build.gradle'), "applicationId 'com.geniex.demo'", "applicationId 'com.geniex.demo.tovarish.test'")
+          replace(Path('build.gradle'), "    // Testing (instrumented UI Automator tests under src/androidTest)", "    testImplementation 'junit:junit:4.13.2'\n\n    // Testing (instrumented UI Automator tests under src/androidTest)")
+          replace(Path('src/main/res/values/strings.xml'), '<string name="app_name">Tovarish</string>', '<string name="app_name">Tovarish Test</string>')
+          layout = Path('src/main/res/layout/activity_main.xml')
+          replace(layout, 'android:id="@+id/pb_downloading"\n', 'android:id="@+id/pb_downloading"\n            style="?android:attr/progressBarStyleHorizontal"\n            android:max="100"\n            android:indeterminate="true"\n')
+          replace(layout, 'android:id="@+id/tv_download_progress"\n            android:layout_width="wrap_content"\n            android:layout_height="wrap_content"\n            android:text="0%"', 'android:id="@+id/tv_download_progress"\n            android:layout_width="match_parent"\n            android:layout_height="wrap_content"\n            android:gravity="center"\n            android:padding="16dp"\n            android:text="Connecting…"')
+          p.with_name('DownloadMeter.kt').write_text('''package com.geniex.demo
+
+          import java.util.Locale
+
+          internal class DownloadMeter {
+              data class State(val text: String, val percent: Int?)
+              private var lastBytes: Long? = null
+              private var lastTime = 0L
+              private var rate: Double? = null
+
+              fun update(done: Long, total: Long?, now: Long): State {
+                  val previous = lastBytes
+                  if (previous == null || done < previous || now < lastTime) {
+                      lastBytes = done
+                      lastTime = now
+                      rate = null
+                  } else if (now - lastTime >= 500L) {
+                      val sample = (done - previous) * 1000.0 / (now - lastTime)
+                      rate = rate?.let { 0.6 * it + 0.4 * sample } ?: sample
+                      lastBytes = done
+                      lastTime = now
+                  }
+                  val validTotal = total?.takeIf { it > 0 && it >= done }
+                  val fraction = validTotal?.let { done.toDouble() / it }
+                  val percent = fraction?.let { (it * 100).toInt().coerceIn(0, 100) }
+                  val speed = rate?.let { fmt(it / 1e6) + " MB/s" } ?: "measuring…"
+                  val amount = if (validTotal != null) "\u0024{fmt(done / 1e6)} / \u0024{fmt(validTotal / 1e6)} MB" else "\u0024{fmt(done / 1e6)} MB (total unknown)"
+                  val eta = if (validTotal != null && rate != null && rate!! > 0.0) {
+                      val seconds = ((validTotal - done) / rate!!).toLong().coerceAtLeast(0)
+                      "\u0024{seconds / 60}m \u0024{seconds % 60}s remaining"
+                  } else "ETA unavailable"
+                  val header = fraction?.let { fmt(it * 100) + "%" } ?: "Downloading…"
+                  return State(listOf(header, amount, speed, eta).joinToString("\\n"), percent)
+              }
+
+              private fun fmt(value: Double) = String.format(Locale.US, "%.1f", value)
+          }
+          ''' )
+          t = Path('src/test/java/com/geniex/demo/DownloadMeterTest.kt')
+          t.parent.mkdir(parents=True, exist_ok=True)
+          t.write_text('''package com.geniex.demo
+
+          import org.junit.Assert.*
+          import org.junit.Test
+
+          class DownloadMeterTest {
+              @Test fun unknownTotalNeverShowsZeroPercent() {
+                  val m = DownloadMeter()
+                  m.update(0, null, 0)
+                  val s = m.update(2000000, null, 1000)
+                  assertNull(s.percent)
+                  assertTrue(s.text.contains("2.0 MB (total unknown)"))
+                  assertTrue(s.text.contains("2.0 MB/s"))
+                  assertTrue(s.text.contains("ETA unavailable"))
+              }
+
+              @Test fun knownTotalShowsFractionAndEta() {
+                  val m = DownloadMeter()
+                  m.update(0, 10000000, 0)
+                  val s = m.update(2000000, 10000000, 1000)
+                  assertEquals(20, s.percent)
+                  assertTrue(s.text.contains("20.0%"))
+                  assertTrue(s.text.contains("0m 4s remaining"))
+              }
+
+              @Test fun changingOrInvalidCountersDoNotFakeProgress() {
+                  val m = DownloadMeter()
+                  m.update(5000000, 10000000, 1000)
+                  val s = m.update(1000000, 500000, 2000)
+                  assertNull(s.percent)
+                  assertTrue(s.text.contains("measuring"))
+              }
+          }
+          ''')
+          PY
+      - name: Show app traffic even when SDK callbacks stall
+        working-directory: upstream/geniex_chat_android
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          p = Path('src/main/java/com/geniex/demo/MainActivity.kt')
+          s = p.read_text()
+          def replace(old, new):
+              global s
+              assert s.count(old) == 1, old
+              s = s.replace(old, new)
+          replace('val meter = DownloadMeter()', '''val meter = DownloadMeter()
+                  val startedAt = android.os.SystemClock.elapsedRealtime()
+                  val initialRx = android.net.TrafficStats.getUidRxBytes(android.os.Process.myUid())
+                  var sdkText = "Waiting for SDK progress…"
+                  var lastCallbackAt = startedAt''')
+          replace('ModelManagerWrapper.pullFlow(input).collect { event ->', '''val monitor = launch(Dispatchers.Main) {
+                          var previousRx = initialRx
+                          var previousAt = startedAt
+                          while (true) {
+                              val now = android.os.SystemClock.elapsedRealtime()
+                              val rx = android.net.TrafficStats.getUidRxBytes(android.os.Process.myUid())
+                              val elapsedMs = now - previousAt
+                              val traffic = if (initialRx >= 0 && rx >= initialRx) String.format(Locale.US, "%.1f MB app traffic", (rx - initialRx) / 1e6) else "App traffic unavailable"
+                              val speed = if (previousRx >= 0 && rx >= previousRx && elapsedMs > 0) String.format(Locale.US, "%.2f MB/s", (rx - previousRx) / 1000.0 / elapsedMs) else "Measuring…"
+                              val elapsed = (now - startedAt) / 1000
+                              val age = (now - lastCallbackAt) / 1000
+                              tvDownloadProgress.text = sdkText + "\\n" + traffic + " · " + speed + "\\nElapsed: " + elapsed + "s · SDK update: " + age + "s ago"
+                              previousRx = rx
+                              previousAt = now
+                              kotlinx.coroutines.delay(1000)
+                          }
+                      }
+                      try {
+                          ModelManagerWrapper.pullFlow(input).collect { event ->''')
+          replace('tvDownloadProgress.text = progress.text', '''sdkText = progress.text
+                                              lastCallbackAt = android.os.SystemClock.elapsedRealtime()''')
+          marker = '} catch (e: kotlinx.coroutines.CancellationException) {'
+          replace(marker, '''} finally {
+                          monitor.cancel()
+                      }
+                  } catch (e: kotlinx.coroutines.CancellationException) {''')
+          p.write_text(s)
+          PY
+      - name: Add model inventory and serialized download retry
+        working-directory: upstream/geniex_chat_android
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          p = Path('src/main/java/com/geniex/demo/MainActivity.kt')
+          s = p.read_text()
+          def replace(old, new, count=1):
+              global s
+              assert s.count(old) == count, old
+              s = s.replace(old, new)
+          replace('private var downloadJob: Job? = null', '''private var downloadJob: Job? = null
+              private var changingDownload = false
+              private var managingModels = false''')
+          replace('if (downloadJob?.isActive == true) {', 'if (changingDownload || downloadJob?.isCompleted == false) {', 2)
+          replace('private fun downloadModel(selectModelData: ModelData) {', '''private fun downloadModel(selectModelData: ModelData) {
+                  if (managingModels || llLoading.visibility == View.VISIBLE) return''')
+          replace("        binding.btnCancelDownload.setOnClickListener {\n            downloadJob?.cancel()\n            downloadJob = null\n            tvDownloadProgress.text = \"0%\"\n            binding.llDownloading.visibility = View.GONE\n        }\n        binding.btnRetryDownload.setOnClickListener {\n            downloadJob?.cancel()\n            downloadJob = null\n            downloadingModelData?.let { downloadModel(it) }\n        }", "        binding.btnCancelDownload.setOnClickListener { finishDownload(false) }\n        binding.btnRetryDownload.setOnClickListener { finishDownload(true) }\n        binding.btnManageModels.setOnClickListener { showModelInventory() }")
+          replace('btnDownload.setOnClickListener {', '''btnDownload.setOnClickListener {
+                      if (changingDownload) {
+                          Toast.makeText(this@MainActivity, "Previous download is still stopping. Open Android app settings if stuck.", Toast.LENGTH_LONG).show()
+                          return@setOnClickListener
+                      }''')
+          replace('btnLoadModel.setOnClickListener {\n', '''btnLoadModel.setOnClickListener {
+                      if (managingModels || changingDownload || downloadJob?.isCompleted == false) {
+                          Toast.makeText(this@MainActivity, "Finish or pause the current download first.", Toast.LENGTH_SHORT).show()
+                          return@setOnClickListener
+                      }
+          '''.replace('\n          ', '\n'))
+          replace('    private fun setListeners() {', '''    private fun finishDownload(retry: Boolean) {
+                  if (changingDownload) return
+                  changingDownload = true
+                  binding.btnCancelDownload.isEnabled = false
+                  binding.btnRetryDownload.isEnabled = false
+                  val previous = downloadJob
+                  val model = downloadingModelData
+                  tvDownloadProgress.text = "Stopping download…"
+                  modelScope.launch(Dispatchers.Main) {
+                      try {
+                          previous?.cancel()
+                          val stopped = kotlinx.coroutines.withTimeoutOrNull(3000L) {
+                              previous?.join()
+                              true
+                          } == true
+                          if (!stopped) {
+                              llDownloading.visibility = View.GONE
+                              if (!isFinishing && !isDestroyed) {
+                                  AlertDialog.Builder(this@MainActivity)
+                                      .setTitle("Download stop pending")
+                                      .setMessage("The native downloader has not stopped yet. Another model cannot be downloaded or loaded until it stops. If it remains stuck, force stop Tovarish in Android app settings and reopen it.")
+                                      .setNegativeButton("Close", null)
+                                      .setPositiveButton("App settings") { _, _ ->
+                                          startActivity(android.content.Intent(android.provider.Settings.ACTION_APPLICATION_DETAILS_SETTINGS, android.net.Uri.parse("package:"+packageName)))
+                                      }.show()
+                              }
+                              previous?.join()
+                          }
+                          downloadJob = null
+                          changingDownload = false
+                          if (isFinishing || isDestroyed) return@launch
+                          if (stopped && retry && model != null) {
+                              downloadModel(model)
+                          } else {
+                              llDownloading.visibility = View.GONE
+                              Toast.makeText(this@MainActivity, "Download stopped. Select a model and press Download.", Toast.LENGTH_LONG).show()
+                          }
+                      } finally {
+                          changingDownload = false
+                          binding.btnCancelDownload.isEnabled = true
+                          binding.btnRetryDownload.isEnabled = true
+                      }
+                  }
+              }
+
+              private fun showModelInventory() {
+                  if (managingModels || changingDownload || downloadJob?.isCompleted == false || hasLoadedModel() || isGenerating || llLoading.visibility == View.VISIBLE) {
+                      Toast.makeText(this, "Pause downloads and unload the model first.", Toast.LENGTH_SHORT).show()
+                      return
+                  }
+                  managingModels = true
+                  val button = binding.btnManageModels
+                  button.isEnabled = false
+                  modelScope.launch(Dispatchers.Main) {
+                      try {
+                          val installed = kotlinx.coroutines.withContext(Dispatchers.IO) {
+                              modelList.filter { ModelManagerWrapper.getPaths(it.modelName) != null }
+                                  .distinctBy { it.modelName }
+                          }
+                          val free = android.os.StatFs(filesDir.absolutePath).availableBytes / 1e9
+                          val title = String.format(Locale.US, "Installed models · %.1f GB free", free)
+                          if (isFinishing || isDestroyed) {
+                              managingModels = false
+                              button.isEnabled = true
+                              return@launch
+                          }
+                          val dialog = AlertDialog.Builder(this@MainActivity).setTitle(title)
+                          if (installed.isEmpty()) {
+                              dialog.setMessage("No complete catalog models downloaded.")
+                          } else {
+                              dialog.setItems(installed.map { it.displayName }.toTypedArray()) { _, index ->
+                                  val selected = installed[index]
+                                  AlertDialog.Builder(this@MainActivity)
+                                      .setTitle("Remove model?")
+                                      .setMessage(selected.displayName + "\\nOnly this downloaded model will be removed. You can download it again.")
+                                      .setNegativeButton("Keep", null)
+                                      .setPositiveButton("Remove") { _, _ ->
+                                          if (managingModels || changingDownload || downloadJob?.isCompleted == false || hasLoadedModel() || isGenerating || llLoading.visibility == View.VISIBLE) {
+                                              Toast.makeText(this@MainActivity, "Model is busy.", Toast.LENGTH_SHORT).show()
+                                              return@setPositiveButton
+                                          }
+                                          managingModels = true
+                                          button.isEnabled = false
+                                          modelScope.launch(Dispatchers.Main) {
+                                              try {
+                                                  val rc = ModelManagerWrapper.remove(selected.modelName)
+                                                  Toast.makeText(this@MainActivity, if (rc == 0) "Model removed" else "Remove failed: " + rc, Toast.LENGTH_LONG).show()
+                                              } catch (e: Exception) {
+                                                  Toast.makeText(this@MainActivity, "Remove failed: " + e.javaClass.simpleName, Toast.LENGTH_LONG).show()
+                                              } finally {
+                                                  managingModels = false
+                                                  button.isEnabled = true
+                                              }
+                                          }
+                                      }
+                                      .show()
+                              }
+                          }
+                          dialog.setNegativeButton("Close", null).setOnDismissListener {
+                              managingModels = false
+                              button.isEnabled = true
+                          }.show()
+                      } catch (e: Exception) {
+                          managingModels = false
+                          button.isEnabled = true
+                          Toast.makeText(this@MainActivity, "Model list unavailable", Toast.LENGTH_LONG).show()
+                      }
+                  }
+              }
+
+              private fun setListeners() {'''.replace('\n          ', '\n'))
+          p.write_text(s)
+          layout = Path('src/main/res/layout/activity_main.xml')
+          xml = layout.read_text()
+          marker = '        <!-- Control buttons section -->'
+          assert xml.count(marker) == 1
+          xml = xml.replace(marker, '''        <Button
+                      android:id="@+id/btn_manage_models"
+                      android:layout_width="match_parent"
+                      android:layout_height="40dp"
+                      android:layout_marginStart="16dp"
+                      android:layout_marginEnd="16dp"
+                      android:text="Installed models / Storage"
+                      android:textAllCaps="false" />
+
+          '''.replace('\n          ', '\n') + marker)
+          xml = xml.replace('android:text="cancel"', 'android:text="Pause"').replace('android:text="retry"', 'android:text="Retry"')
+          layout.write_text(xml)
+          PY
+      - name: Apply Tovarish AMOLED dark theme
+        working-directory: upstream/geniex_chat_android
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          import re
+          import xml.etree.ElementTree as ET
+          root = Path('src/main')
+          res = root / 'res'
+          def edit(p, old, new):
+              s = p.read_text()
+              assert old in s, f'Missing anchor: {p}: {old}'
+              p.write_text(s.replace(old, new))
+          colors = res / 'values/colors.xml'
+          edit(colors, '<color name="bg_normal">#F6F7F9</color>', '<color name="bg_normal">#000000</color>')
+          edit(colors, '<color name="font_black">#1F1F1F</color>', '<color name="font_black">#F2F2F3</color>')
+          edit(colors, '</resources>', '''    <color name="tovarish_surface">#151518</color>
+              <color name="tovarish_accent">#8AB4FF</color>
+              <color name="tovarish_secondary">#B8B8C0</color>
+          </resources>''')
+          theme = res / 'values/themes.xml'
+          edit(theme, '</resources>', '''    <style name="Theme.Tovarish" parent="Theme.MaterialComponents.NoActionBar">
+                  <item name="android:windowBackground">@color/bg_normal</item>
+                  <item name="android:colorBackground">@color/bg_normal</item>
+                  <item name="colorSurface">@color/tovarish_surface</item>
+                  <item name="colorOnSurface">@color/font_black</item>
+                  <item name="colorPrimary">@color/tovarish_accent</item>
+                  <item name="colorPrimaryVariant">@color/tovarish_accent</item>
+                  <item name="colorOnPrimary">@color/black</item>
+                  <item name="colorSecondary">@color/tovarish_accent</item>
+                  <item name="colorOnSecondary">@color/black</item>
+                  <item name="android:textColorPrimary">@color/font_black</item>
+                  <item name="android:textColorSecondary">@color/tovarish_secondary</item>
+                  <item name="android:textColorLink">@color/tovarish_accent</item>
+                  <item name="android:statusBarColor">@color/black</item>
+                  <item name="android:navigationBarColor">@color/black</item>
+                  <item name="android:windowLightStatusBar">false</item>
+                  <item name="android:windowLightNavigationBar">false</item>
+                  <item name="android:forceDarkAllowed">false</item>
+              </style>
+          </resources>''')
+          edit(root / 'AndroidManifest.xml', '@style/Theme.MaterialComponents.Light.NoActionBar', '@style/Theme.Tovarish')
+          edit(theme, 'Theme.Design.Light.BottomSheetDialog', 'Theme.Design.BottomSheetDialog')
+          for name in ('MainActivity.kt', 'activity/FileContentActivity.kt'):
+              p = root / 'java/com/geniex/demo' / name
+              edit(p, 'statusBarColorInt(Color.WHITE)', 'statusBarColorInt(Color.BLACK)')
+              edit(p, 'statusBarDarkFont(true)', 'statusBarDarkFont(false)')
+          # Recolor layout UI attributes, without changing image assets or launcher art.
+          palette = {'#1F1F1F':'#F2F2F3', '#888888':'#B8B8C0', '#ADADAD':'#A6A6AF', '#E7E7E7':'#303036', '#FFFFFF':'#151518', '#FFFFFFFF':'#FF151518', '#F6F7F9':'#000000'}
+          for p in res.glob('layout*/*.xml'):
+              def recolor(m):
+                  attr, value = m.groups()
+                  if value == '@color/white' and attr == 'background':
+                      value = '@color/tovarish_surface'
+                  elif value.upper() in palette:
+                      value = palette[value.upper()]
+                  return 'android:'+attr+'="'+value+'"'
+              p.write_text(re.sub(r'android:(textColor|textColorHint|background)="([^"]+)"', recolor, p.read_text()))
+          edit(res/'drawable/btn_rounded_border.xml', '#FFFFFFFF', '#FF151518')
+          edit(res/'drawable/bg_input_box_background.xml', '#ffffff', '#151518')
+          edit(res/'drawable/bg_user_message.xml', '#DBEAEB', '#202D40')
+          # Basic resource validation before invoking Android's resource compiler.
+          for p in [colors, theme, root/'AndroidManifest.xml', *res.glob('layout*/*.xml')]:
+              ET.parse(p)
+          PY
+      - name: Stabilize download status layout
+        working-directory: upstream/geniex_chat_android
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          import xml.etree.ElementTree as ET
+          p = Path('src/main/res/layout/activity_main.xml')
+          s = p.read_text()
+          marker = 'android:id="@+id/tv_download_progress"'
+          assert s.count(marker) == 1
+          s = s.replace(marker, marker + '\n            android:minLines="6"')
+          p.write_text(s)
+          ET.parse(p)
+          kotlin = Path('src/main/java/com/geniex/demo/MainActivity.kt').read_text()
+          assert 'tvDownloadProgress.text = sdkText + ' in kotlin
+          assert 'tvDownloadProgress.text = sdkText\n' not in kotlin
+          PY
+      - name: Select chipset-specific NPU bundles and record native load diagnostics
+        working-directory: upstream/geniex_chat_android
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          p = Path('src/main/java/com/geniex/demo/MainActivity.kt')
+          s = p.read_text()
+          def replace(old, new):
+              global s
+              assert s.count(old) == 1, old
+              s = s.replace(old, new)
+          replace('modelList = json.decodeFromString<List<ModelData>>(baseJson)', '''val chipset = android.os.Build.SOC_MODEL.trim().uppercase(Locale.US)
+              val supportedChipsets = setOf("SM8750", "SM8850")
+              val verifiedNpuModels = setOf("Qwen3-4B", "Qwen3-4B-Instruct-2507")
+              modelList = json.decodeFromString<List<ModelData>>(baseJson).mapNotNull { model ->
+                  when {
+                      model.runtime != "qairt" -> model
+                      chipset !in supportedChipsets -> null
+                      model.id !in verifiedNpuModels -> null
+                      else -> model.copy(chipset = chipset, displayName = model.displayName + " · " + chipset)
+                  }
+              }
+              Log.i(TAG, "SoC="+chipset+" model="+android.os.Build.MODEL+" NPU catalog="+modelList.count { it.runtime == "qairt" })''')
+          replace('        setListeners()\n    }', '''        setListeners()
+                  val interrupted = getSharedPreferences("native_load", MODE_PRIVATE).getString("pending", null)
+                  if (interrupted != null) {
+                      val report = buildString {
+                          append(interrupted)
+                          append("\\n\\nAndroid process exit history:")
+                          val manager = getSystemService(Context.ACTIVITY_SERVICE) as android.app.ActivityManager
+                          try {
+                              manager.getHistoricalProcessExitReasons(packageName, 0, 5).forEach { exit ->
+                                  val reason = when (exit.reason) {
+                                      android.app.ApplicationExitInfo.REASON_LOW_MEMORY -> "LOW_MEMORY"
+                                      android.app.ApplicationExitInfo.REASON_CRASH_NATIVE -> "CRASH_NATIVE"
+                                      android.app.ApplicationExitInfo.REASON_CRASH -> "CRASH"
+                                      android.app.ApplicationExitInfo.REASON_SIGNALED -> "SIGNALED"
+                                      android.app.ApplicationExitInfo.REASON_ANR -> "ANR"
+                                      else -> "reason=" + exit.reason
+                                  }
+                                  append("\\n" + java.util.Date(exit.timestamp) + " | " + reason + " | status=" + exit.status + " | PSS=" + exit.pss + " KiB | RSS=" + exit.rss + " KiB")
+                                  append("\\n" + (exit.description ?: "No description").take(400))
+                              }
+                          } catch (e: Exception) {
+                              append("\\nExit history unavailable: " + e.javaClass.simpleName)
+                          }
+                      }
+                      AlertDialog.Builder(this)
+                          .setTitle("Previous native load interrupted")
+                          .setMessage(report + "\\n\\nNPU loading blocked pending diagnosis. CPU/GPU models remain available.")
+                          .setNeutralButton("Copy diagnostics") { _, _ ->
+                              val clipboard = getSystemService(Context.CLIPBOARD_SERVICE) as android.content.ClipboardManager
+                              clipboard.setPrimaryClip(android.content.ClipData.newPlainText("Tovarish NPU diagnostics", report))
+                          }
+                          .setPositiveButton("OK", null)
+                          .show()
+                  }
+              }''')
+          replace('            val pluginId = paths.runtime_id.ifEmpty { modelDataPluginId }', '''            val pluginId = paths.runtime_id.ifEmpty { modelDataPluginId }
+                      val isNativeNpu = pluginId == "qairt" || selectModelData.runtime == "qairt"
+                      val loadPrefs = getSharedPreferences("native_load", MODE_PRIVATE)
+                      if (isNativeNpu) {
+                          val chip = android.os.Build.SOC_MODEL.trim().uppercase(Locale.US)
+                          if (chip != selectModelData.chipset || chip !in setOf("SM8750", "SM8850")) {
+                              onLoadModelFailed("NPU chipset mismatch: "+chip)
+                              return@launch
+                          }
+                          if (loadPrefs.getString("pending_id", null) != null) {
+                              onLoadModelFailed("A previous native NPU load was interrupted. NPU loading blocked pending diagnosis.")
+                              return@launch
+                          }
+                          val manager = getSystemService(Context.ACTIVITY_SERVICE) as android.app.ActivityManager
+                          val memory = android.app.ActivityManager.MemoryInfo()
+                          manager.getMemoryInfo(memory)
+                          val details = selectModelData.displayName + " | SoC=" + chip + " | Android=" + android.os.Build.VERSION.SDK_INT + " | runtime=" + pluginId + " | available RAM=" + (memory.availMem / 1048576) + " MiB | total RAM=" + (memory.totalMem / 1048576) + " MiB"
+                          Log.i(TAG, "Native load preflight: "+details)
+                          if (memory.lowMemory) {
+                              onLoadModelFailed("Android reports low memory; native load not started.")
+                              return@launch
+                          }
+                          if (!loadPrefs.edit().putString("pending_id", selectModelData.id).putString("pending", details + " | start=" + java.util.Date()).commit()) {
+                              onLoadModelFailed("Cannot save native load diagnostic.")
+                              return@launch
+                          }
+                      }''')
+          replace('                            isLoadLlmModel = true', '''                            if (isNativeNpu) loadPrefs.edit().remove("pending_id").remove("pending").commit()
+                                      isLoadLlmModel = true''')
+          old = '                            onLoadModelFailed(error.message.toString())'
+          assert s.count(old) == 2
+          s = s.replace(old, '                            if (isNativeNpu) loadPrefs.edit().remove("pending_id").remove("pending").commit()\n'+old)
+          replace('                            isLoadVlmModel = true', '''                            if (isNativeNpu) loadPrefs.edit().remove("pending_id").remove("pending").commit()
+                                      isLoadVlmModel = true''')
+          p.write_text(s)
+          # New sandbox prevents a previous SM8750 cache from masquerading as SM8850.
+          build = Path('build.gradle')
+          gradle = build.read_text()
+          old = "applicationId 'com.geniex.demo.tovarish.test'"
+          assert gradle.count(old) == 1
+          build.write_text(gradle.replace(old, "applicationId 'com.geniex.demo.tovarish.chipsettest'"))
+          PY
+      - name: Move downloads into an Android foreground data-sync service
+        working-directory: upstream/geniex_chat_android
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          import xml.etree.ElementTree as ET
+          root = Path('src/main')
+          p = root / 'java/com/geniex/demo/MainActivity.kt'
+          s = p.read_text()
+          def replace(old, new):
+              global s
+              assert s.count(old) == 1, old
+              s = s.replace(old, new)
+          def section(start, end, new):
+              global s
+              a = s.index(start)
+              b = s.index(end, a)
+              s = s[:a] + new + s[b:]
+          replace('private var downloadJob: Job? = null', 'private var downloadObserver: Job? = null')
+          replace('private var changingDownload = false', 'private val changingDownload: Boolean get() = ModelDownloadService.state.value.stopping')
+          replace('private var downloadingModelData: ModelData? = null', 'private val downloadingModelData: ModelData? get() = ModelDownloadService.selected')
+          s = s.replace('downloadJob?.isCompleted == false', 'ModelDownloadService.state.value.busy')
+          section('    private fun downloadModel(selectModelData: ModelData) {', '    private fun finishDownload(retry: Boolean) {', '''    private fun downloadModel(selectModelData: ModelData) {
+                  if (managingModels || hasLoadedModel() || isGenerating || llLoading.visibility == View.VISIBLE) return
+                  if (ModelDownloadService.state.value.busy) return
+                  ModelDownloadService.begin(this, selectModelData)
+              }
+          
+          ''')
+          section('    private fun finishDownload(retry: Boolean) {', '    private fun showModelInventory()', '''    private fun finishDownload(retry: Boolean) {
+                  if (ModelDownloadService.state.value.busy) {
+                      ModelDownloadService.pause(this)
+                  } else if (retry) {
+                      downloadingModelData?.let { downloadModel(it) }
+                  }
+              }
+          
+              private fun observeDownloads() {
+                  downloadObserver = modelScope.launch(Dispatchers.Main) {
+                      var previousBusy = false
+                      var warned = false
+                      ModelDownloadService.state.collect { state ->
+                          if (isFinishing || isDestroyed) return@collect
+                          llDownloading.visibility = if (state.busy && !state.timedOut || state.error) View.VISIBLE else View.GONE
+                          tvDownloadProgress.text = state.name + "\\n" + state.text
+                          pbDownloading.isIndeterminate = state.percent == null
+                          state.percent?.let { pbDownloading.progress = it }
+                          binding.btnCancelDownload.isEnabled = state.busy && !state.stopping
+                          binding.btnRetryDownload.isEnabled = !state.stopping
+                          if (state.timedOut && !warned) {
+                              warned = true
+                              AlertDialog.Builder(this@MainActivity)
+                                  .setTitle("Download stop pending")
+                                  .setMessage("The native downloader has not stopped. You can reopen Android app settings and force stop Tovarish if needed.")
+                                  .setNegativeButton("Close", null)
+                                  .setPositiveButton("App settings") { _, _ ->
+                                      startActivity(android.content.Intent(android.provider.Settings.ACTION_APPLICATION_DETAILS_SETTINGS, android.net.Uri.parse("package:"+packageName)))
+                                  }.show()
+                          }
+                          if (!state.busy) {
+                              warned = false
+                              if (previousBusy && state.text.isNotBlank())
+                                  Toast.makeText(this@MainActivity, state.text, Toast.LENGTH_LONG).show()
+                          }
+                          previousBusy = state.busy
+                      }
+                  }
+              }
+          
+              override fun onDestroy() {
+                  downloadObserver?.cancel()
+                  super.onDestroy()
+              }
+          
+          ''')
+          replace('        setListeners()\n', '        setListeners()\n        observeDownloads()\n')
+          assert 'downloadJob' not in s
+          p.write_text(s)
+          manifest = root / 'AndroidManifest.xml'
+          xml = manifest.read_text()
+          marker = '<uses-permission android:name="android.permission.WAKE_LOCK" />'
+          assert xml.count(marker) == 1
+          xml = xml.replace(marker, marker + '\n    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />\n    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />\n    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />')
+          marker = '        <provider\n'
+          assert xml.count(marker) == 1
+          xml = xml.replace(marker, '        <service android:name=".ModelDownloadService" android:exported="false" android:foregroundServiceType="dataSync" />\n\n' + marker)
+          ET.fromstring(xml)
+          manifest.write_text(xml)
+          
+          p.with_name('ModelDownloadService.kt').write_text("package com.geniex.demo\n\nimport android.app.Notification\nimport android.app.NotificationChannel\nimport android.app.NotificationManager\nimport android.app.PendingIntent\nimport android.app.Service\nimport android.content.Context\nimport android.content.Intent\nimport android.os.IBinder\nimport android.os.PowerManager\nimport android.os.SystemClock\nimport com.geniex.demo.bean.ModelData\nimport com.geniex.sdk.ModelManagerWrapper\nimport com.geniex.sdk.bean.HubSource\nimport com.geniex.sdk.bean.ModelPullInput\nimport kotlinx.coroutines.*\nimport kotlinx.coroutines.flow.MutableStateFlow\nimport kotlinx.coroutines.flow.asStateFlow\n\ninternal class ModelDownloadService : Service() {\n    data class Status(val busy: Boolean = false, val stopping: Boolean = false,\n        val timedOut: Boolean = false, val name: String = \"\", val text: String = \"\",\n        val percent: Int? = null, val error: Boolean = false)\n    companion object {\n        private val mutable = MutableStateFlow(Status())\n        val state = mutable.asStateFlow()\n        var selected: ModelData? = null\n            private set\n        fun begin(context: Context, model: ModelData) {\n            if (mutable.value.busy) return\n            selected = model\n            mutable.value = Status(busy = true, name = model.displayName, text = \"Connecting…\")\n            try {\n                context.startForegroundService(Intent(context, ModelDownloadService::class.java))\n            } catch (e: Exception) {\n                mutable.value = Status(name = model.displayName, text = \"Cannot start download: \" + e.javaClass.simpleName, error = true)\n            }\n        }\n        fun pause(context: Context) {\n            if (!mutable.value.busy || mutable.value.stopping) return\n            try {\n                context.startService(Intent(context, ModelDownloadService::class.java).setAction(\"pause\"))\n            } catch (e: Exception) {\n                mutable.value = mutable.value.copy(text = \"Cannot request pause: \" + e.javaClass.simpleName)\n            }\n        }\n    }\n    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)\n    private var task: Job? = null\n    private var wake: PowerManager.WakeLock? = null\n    private lateinit var notifications: NotificationManager\n    private val channel = \"model_downloads\"\n    private val notificationId = 4201\n    override fun onBind(intent: Intent?): IBinder? = null\n    override fun onCreate() {\n        super.onCreate()\n        notifications = getSystemService(NotificationManager::class.java)\n        notifications.createNotificationChannel(NotificationChannel(channel, \"Model downloads\", NotificationManager.IMPORTANCE_LOW))\n    }\n    private fun notification(): Notification {\n        val status = mutable.value\n        val open = PendingIntent.getActivity(this, 0, Intent(this, MainActivity::class.java)\n            .addFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP or Intent.FLAG_ACTIVITY_CLEAR_TOP), PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT)\n        return Notification.Builder(this, channel)\n            .setSmallIcon(android.R.drawable.stat_sys_download)\n            .setContentTitle(status.name.ifEmpty { \"Tovarish download\" })\n            .setContentText(if (status.stopping) \"Stopping…\" else status.text.lineSequence().firstOrNull().orEmpty())\n            .setProgress(100, status.percent ?: 0, status.percent == null)\n            .setOnlyAlertOnce(true).setOngoing(true).setContentIntent(open).build()\n    }\n    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {\n        if (intent?.action == \"pause\") {\n            if (task?.isCompleted == false && !mutable.value.stopping) {\n                mutable.value = mutable.value.copy(stopping = true, text = \"Stopping download…\")\n                val previous = task\n                previous?.cancel()\n                scope.launch {\n                    if (withTimeoutOrNull(3000L) { previous?.join(); true } != true && mutable.value.busy) {\n                        mutable.value = mutable.value.copy(timedOut = true, text = \"Native download still stopping. Reopen app settings if needed.\")\n                    }\n                }\n            }\n            return START_NOT_STICKY\n        }\n        if (task?.isCompleted == false) return START_NOT_STICKY\n        startForeground(notificationId, notification())\n        val model = selected\n        if (model == null || !mutable.value.busy) {\n            stopForeground(STOP_FOREGROUND_REMOVE)\n            stopSelf()\n            return START_NOT_STICKY\n        }\n        task = scope.launch(start = CoroutineStart.LAZY) {\n            var outcome = Status(name = model.displayName, text = \"Download interrupted; tap Download to retry.\", error = true)\n            var monitor: Job? = null\n            try {\n                wake = (getSystemService(Context.POWER_SERVICE) as PowerManager)\n                    .newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, \"tovarish:model_download\")\n                wake?.acquire(2 * 60 * 60 * 1000L)\n                if (ModelManagerWrapper.getPaths(model.modelName) != null) {\n                    outcome = Status(name = model.displayName, text = \"Model already downloaded.\")\n                    return@launch\n                }\n                val hub = runCatching { HubSource.valueOf(model.hub ?: \"AUTO\") }.getOrDefault(HubSource.AUTO)\n                val input = ModelPullInput(model_name = model.modelName, precision = model.quant, hub = hub,\n                    chipset = model.chipset, display_name = model.aiHubDisplayName)\n                val meter = DownloadMeter()\n                val started = SystemClock.elapsedRealtime()\n                val initialRx = android.net.TrafficStats.getUidRxBytes(android.os.Process.myUid())\n                var lastCallback = started\n                var sdkText = \"Waiting for SDK progress…\"\n                var percent: Int? = null\n                monitor = launch {\n                    while (true) {\n                        val now = SystemClock.elapsedRealtime()\n                        val rx = android.net.TrafficStats.getUidRxBytes(android.os.Process.myUid())\n                        val traffic = if (initialRx >= 0 && rx >= initialRx)\n                            String.format(java.util.Locale.US, \"%.1f MB app traffic\", (rx-initialRx)/1e6) else \"App traffic unavailable\"\n                        if (!mutable.value.stopping) {\n                            mutable.value = Status(busy = true, name = model.displayName, percent = percent,\n                                text = sdkText + \"\\n\" + traffic + \"\\nSDK update: \" + ((now-lastCallback)/1000) + \"s ago\")\n                            notifications.notify(notificationId, notification())\n                        }\n                        delay(1000)\n                    }\n                }\n                ModelManagerWrapper.pullFlow(input).collect { event ->\n                    when (event) {\n                        is ModelManagerWrapper.PullEvent.Progress -> {\n                            val done = event.files.sumOf { it.downloaded_bytes.coerceAtLeast(0L) }\n                            val total = if (event.files.isNotEmpty() && event.files.all { it.total_bytes > 0L })\n                                event.files.sumOf { it.total_bytes } else null\n                            val progress = meter.update(done, total, SystemClock.elapsedRealtime())\n                            sdkText = progress.text\n                            percent = progress.percent\n                            lastCallback = SystemClock.elapsedRealtime()\n                        }\n                        is ModelManagerWrapper.PullEvent.Completed -> {\n                            outcome = Status(name = model.displayName, text = \"Model downloaded.\")\n                        }\n                        is ModelManagerWrapper.PullEvent.Error -> {\n                            outcome = Status(name = model.displayName, text = \"Download failed (code \" + event.code + \"). Tap Download to retry.\", error = true)\n                        }\n                    }\n                }\n            } catch (e: CancellationException) {\n                outcome = Status(name = model.displayName, text = \"Download stopped. Tap Download to continue.\")\n                throw e\n            } catch (e: Exception) {\n                outcome = Status(name = model.displayName, text = \"Download failed: \" + e.javaClass.simpleName, error = true)\n            } finally {\n                monitor?.cancel()\n                wake?.let { if (it.isHeld) it.release() }\n                wake = null\n                mutable.value = outcome\n                stopForeground(STOP_FOREGROUND_REMOVE)\n                stopSelf()\n            }\n        }\n        task?.start()\n        return START_NOT_STICKY\n    }\n    override fun onDestroy() {\n        scope.cancel()\n        super.onDestroy()\n    }\n}\n")
+          PY
+      - name: Check out Tovarish download source
+        uses: actions/checkout@v4
+        with:
+          repository: LHONE-mf/Tovarish
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          path: tovarish
+          persist-credentials: false
+      - name: Use resumable archive downloads for QAIRT
+        working-directory: upstream/geniex_chat_android
+        run: |
+          cp ../../tovarish/android-overrides/QairtArchiveDownloader.kt src/main/java/com/geniex/demo/
+          cp ../../tovarish/android-overrides/QairtArchiveDownloaderTest.kt src/test/java/com/geniex/demo/
+          python - <<'PY'
+          from pathlib import Path
+          p = Path('src/main/java/com/geniex/demo/ModelDownloadService.kt')
+          s = p.read_text()
+          def replace(old, new):
+              global s
+              assert s.count(old) == 1, old
+              s = s.replace(old, new)
+          replace('val input = ModelPullInput(model_name = model.modelName, precision = model.quant, hub = hub,\n                    chipset = model.chipset, display_name = model.aiHubDisplayName)', '''val archiveRoot = java.io.File(filesDir, "qairt-transfers")
+                  val isQairt = model.runtime == "qairt"
+                  val input = if (isQairt) {
+                      val extracted = QairtArchiveDownloader.prepare(archiveRoot, model) { done, total, phase ->
+                          withContext(Dispatchers.Main) {
+                              val fraction = total?.takeIf { it > 0 }?.let { (100.0 * done / it).toInt().coerceIn(0, 100) }
+                              val amount = String.format(java.util.Locale.US, "%.1f MB", done / 1e6)
+                              mutable.value = mutable.value.copy(text = phase + " · " + amount, percent = fraction)
+                              notifications.notify(notificationId, notification())
+                          }
+                      }
+                      ModelPullInput(model_name = model.modelName, hub = HubSource.LOCALFS, local_path = extracted.absolutePath)
+                  } else {
+                      ModelPullInput(model_name = model.modelName, precision = model.quant, hub = hub,
+                          chipset = model.chipset, display_name = model.aiHubDisplayName)
+                  }''')
+          replace('text = "Download failed: " + e.javaClass.simpleName, error = true)', 'text = "Download failed: " + (e.message ?: e.javaClass.simpleName).take(240), error = true)')
+          replace('var sdkText = "Waiting for SDK progress…"', 'var sdkText = if (isQairt) "Importing verified archive into GenieX…" else "Waiting for SDK progress…"')
+          replace('sdkText = progress.text', 'sdkText = (if (isQairt) "Importing verified archive\\n" else "") + progress.text')
+          replace('outcome = Status(name = model.displayName, text = "Model downloaded.")', '''if (ModelManagerWrapper.getPaths(model.modelName) == null) {
+                              outcome = Status(name = model.displayName, text = "Import completed but model registration is missing.", error = true)
+                          } else {
+                              if (isQairt) withContext(Dispatchers.IO) { QairtArchiveDownloader.cleanup(archiveRoot, model) }
+                              outcome = Status(name = model.displayName, text = "Model downloaded.")
+                          }''')
+          p.write_text(s)
+          p = Path('src/main/java/com/geniex/demo/MainActivity.kt')
+          s = p.read_text()
+          old = 'model.copy(chipset = chipset, displayName = model.displayName + " · " + chipset)'
+          assert s.count(old) == 1
+          s = s.replace(old, 'model.copy(chipset = chipset, modelName = "tovarish-" + chipset.lowercase(Locale.US) + "/" + model.id, displayName = model.displayName + " · " + chipset)')
+          p.write_text(s)
+          PY
+      - name: Add foreground memory monitor and guarded NPU preflight
+        working-directory: upstream/geniex_chat_android
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          p = Path('src/main/java/com/geniex/demo/MainActivity.kt')
+          s = p.read_text()
+          def replace(old, new):
+              global s
+              assert s.count(old) == 1, old
+              s = s.replace(old, new)
+          replace('private var downloadObserver: Job? = null', '''private var downloadObserver: Job? = null
+              private var ramObserver: Job? = null''')
+          replace('    override fun onDestroy() {', '''    override fun onStart() {
+                  super.onStart()
+                  ramObserver?.cancel()
+                  ramObserver = modelScope.launch(Dispatchers.Main) {
+                      val manager = getSystemService(Context.ACTIVITY_SERVICE) as android.app.ActivityManager
+                      while (true) {
+                          val memory = android.app.ActivityManager.MemoryInfo()
+                          manager.getMemoryInfo(memory)
+                          val available = memory.availMem / 1073741824.0
+                          val total = memory.totalMem / 1073741824.0
+                          val selected = modelList.firstOrNull { it.id == selectModelId }
+                          val npu = selected?.runtime == "qairt"
+                          val suffix = if (npu) " | NPU preflight floor: 5 GiB (provisional)" else ""
+                          binding.tvRamStatus.text = String.format(Locale.US, "RAM: %.2f / %.2f GiB available", available, total) + suffix
+                          binding.tvRamStatus.setTextColor(android.graphics.Color.parseColor(
+                              if (memory.lowMemory || (npu && available < 5.0)) "#FFB86C" else "#F2F2F3"))
+                          kotlinx.coroutines.delay(2000)
+                      }
+                  }
+              }
+
+              override fun onStop() {
+                  ramObserver?.cancel()
+                  ramObserver = null
+                  super.onStop()
+              }
+
+              override fun onDestroy() {''')
+          replace('if (memory.lowMemory) {\n', '''val modelFile = File(paths.model_path)
+                          val modelFolder = if (modelFile.isDirectory) modelFile else modelFile.parentFile
+                          val weights = modelFolder?.listFiles()?.filter { it.isFile && it.name.endsWith(".bin", true) }?.sumOf { it.length() } ?: 0L
+                          val minimum = maxOf(5L * 1073741824L, weights + 1610612736L, memory.threshold + 1073741824L)
+                          if (memory.availMem < minimum) {
+                              onLoadModelFailed(String.format(Locale.US, "NPU load blocked: %.2f GiB available; provisional minimum %.2f GiB. Actual runtime requirement is not yet verified.", memory.availMem / 1073741824.0, minimum / 1073741824.0))
+                              return@launch
+                          }
+                          if (memory.lowMemory) {
+          '''.rstrip() + '\n')
+          p.write_text(s)
+          p = Path('src/main/res/layout/activity_main.xml')
+          x = p.read_text()
+          marker = '        <!-- Control buttons section -->'
+          assert x.count(marker) == 1
+          p.write_text(x.replace(marker, '''        <TextView
+                      android:id="@+id/tv_ram_status"
+                      android:layout_width="match_parent"
+                      android:layout_height="wrap_content"
+                      android:paddingStart="16dp"
+                      android:paddingEnd="16dp"
+                      android:paddingTop="4dp"
+                      android:paddingBottom="4dp"
+                      android:textColor="#F2F2F3"
+                      android:textSize="12sp" />
+
+          ''' + marker))
+          # A new package keeps the old diagnostic installation and its private data intact.
+          p = Path('build.gradle')
+          x = p.read_text()
+          old = "applicationId 'com.geniex.demo.tovarish.chipsettest'"
+          assert x.count(old) == 1
+          p.write_text(x.replace(old, "applicationId 'com.geniex.demo.tovarish.stabletest'"))
+          p = Path('src/main/res/values/strings.xml')
+          x = p.read_text()
+          assert x.count('Tovarish Test') == 1
+          p.write_text(x.replace('Tovarish Test', 'Tovarish Dev'))
+          PY
+      - name: Add process memory telemetry and bounded GGUF context selection
+        working-directory: upstream/geniex_chat_android
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          p = Path('src/main/java/com/geniex/demo/MainActivity.kt')
+          s = p.read_text()
+          def replace(old, new):
+              global s
+              assert s.count(old) == 1, old
+              s = s.replace(old, new)
+          replace('private var ramObserver: Job? = null', '''private var ramObserver: Job? = null
+              @Volatile private var requestedBackend = "No model loaded"
+              private var peakPssKiB = 0L
+              private var memorySample = 0
+              private var processMemory = "Sampling process memory..."
+              ''')
+          replace('kotlinx.coroutines.delay(2000)', '''                          if (memorySample++ % 2 == 0) {
+                                  processMemory = kotlinx.coroutines.withContext(Dispatchers.IO) {
+                                      val info = android.os.Debug.MemoryInfo()
+                                      android.os.Debug.getMemoryInfo(info)
+                                      val pss = info.totalPss.toLong()
+                                      val values = runCatching {
+                                          File("/proc/self/status").readLines().mapNotNull { line ->
+                                              val key = line.substringBefore(':')
+                                              if (key == "VmRSS" || key == "VmHWM")
+                                                  key to line.substringAfter(':').trim().substringBefore(' ').toLongOrNull()
+                                              else null
+                                          }.toMap()
+                                      }.getOrDefault(emptyMap())
+                                      peakPssKiB = maxOf(peakPssKiB, pss)
+                                      fun mib(value: Long?): String = value?.let { String.format(Locale.US, "%.0f", it / 1024.0) } ?: "?"
+                                      "Process PSS " + mib(pss) + " MiB (sampled peak " + mib(peakPssKiB) + ") | RSS " + mib(values["VmRSS"]) + " MiB (peak " + mib(values["VmHWM"]) + ")"
+                                  }
+                              }
+                              binding.tvEngineStatus.text = requestedBackend + "\\n" + processMemory
+                              kotlinx.coroutines.delay(2000)''')
+          replace('        deviceId: String? = null,\n    ) {', '        deviceId: String? = null,\n        contextTokens: Int = 1024,\n    ) {')
+          replace('            val resolvedDeviceId = deviceId', '''            val resolvedDeviceId = deviceId
+                      val requested = when (resolvedDeviceId) {
+                          ComputeUnitValue.CPU.value -> "CPU"
+                          ComputeUnitValue.GPU.value -> "GPU"
+                          ComputeUnitValue.NPU.value -> "NPU"
+                          else -> if (pluginId == "qairt") "NPU" else "default"
+                      }
+                      requestedBackend = "Requested: " + requested + " | runtime: " + pluginId + " | actual placement unverified"''')
+          replace('                                nCtx = 1024,', '                                nCtx = contextTokens,')
+          replace('        isLoadLlmModel = false\n        isLoadVlmModel = false', '        requestedBackend = "No model loaded"\n        isLoadLlmModel = false\n        isLoadVlmModel = false')
+          replace('    private fun onLoadModelFailed(tip: String) {\n', '    private fun onLoadModelFailed(tip: String) {\n        requestedBackend = "Load failed"\n')
+          replace('            supportPluginIds.forEach {', '''            val contextOptions = listOf(512, 1024, 2048)
+                      dialogBinding.llContext.visibility = if (isGgufLlmModel) View.VISIBLE else View.GONE
+                      dialogBinding.spContext.adapter = android.widget.ArrayAdapter(
+                          this, android.R.layout.simple_spinner_dropdown_item, contextOptions.map { it.toString() })
+                      dialogBinding.spContext.setSelection(1)
+                      supportPluginIds.forEach {''')
+          replace('                                loadModel(selectModelData, modelDataPluginId, nGpuLayers, ggufLlmDeviceId)', '''                                val context = if (isGgufLlmModel) contextOptions[dialogBinding.spContext.selectedItemPosition.coerceIn(0, 2)] else 1024
+                                          loadModel(selectModelData, modelDataPluginId, nGpuLayers, ggufLlmDeviceId, context)''')
+          p.write_text(s)
+          p = Path('src/main/res/layout/activity_main.xml')
+          x = p.read_text()
+          marker = '        <!-- Control buttons section -->'
+          assert x.count(marker) == 1
+          p.write_text(x.replace(marker, '''        <TextView
+                      android:id="@+id/tv_engine_status"
+                      android:layout_width="match_parent"
+                      android:layout_height="wrap_content"
+                      android:paddingStart="16dp"
+                      android:paddingEnd="16dp"
+                      android:textColor="#F2F2F3"
+                      android:textSize="11sp" />
+
+          ''' + marker))
+          p = Path('src/main/res/layout/dialog_select_plugin_id.xml')
+          x = p.read_text()
+          marker = '    <LinearLayout\n        android:id="@+id/ll_gpu_layers"'
+          assert x.count(marker) == 1
+          p.write_text(x.replace(marker, '''    <LinearLayout
+                  android:id="@+id/ll_context"
+                  android:layout_width="match_parent"
+                  android:layout_height="wrap_content"
+                  android:orientation="horizontal"
+                  android:visibility="gone">
+                  <TextView
+                      android:layout_width="wrap_content"
+                      android:layout_height="wrap_content"
+                      android:text="Context tokens: " />
+                  <Spinner
+                      android:id="@+id/sp_context"
+                      android:layout_width="wrap_content"
+                      android:layout_height="wrap_content" />
+              </LinearLayout>
+
+          ''' + marker))
+          p = Path('build.gradle')
+          x = p.read_text()
+          assert x.count('versionCode 1') == 1
+          p.write_text(x.replace('versionCode 1', 'versionCode 2').replace("versionName '1.0'", "versionName '1.1-dev'"))
+          PY
+      - name: Route text inference through a private worker process
+        working-directory: upstream/geniex_chat_android
+        run: |
+          cp ../../tovarish/android-overrides/TextInferenceService.kt src/main/java/com/geniex/demo/
+          python - <<'PY'
+          from pathlib import Path
+          p = Path('src/main/java/com/geniex/demo/MainActivity.kt')
+          s = p.read_text()
+          def replace(old, new):
+              global s
+              assert s.count(old) == 1, old
+              s = s.replace(old, new)
+          replace('private lateinit var llmWrapper: LlmWrapper', '''private val textInference by lazy {
+                  TextInferenceClient(this) {
+                      if (!isDestroyed && !isFinishing) {
+                          resetLoadState()
+                          isGenerating = false
+                          removeLoadingIndicator()
+                          vTip.visibility = View.GONE
+                          llLoading.visibility = View.GONE
+                          btnUnloadModel.visibility = View.GONE
+                          btnStop.visibility = View.GONE
+                          btnAddImage.visibility = View.INVISIBLE
+                          requestedBackend = "Inference worker disconnected"
+                          messages.add(Message("Inference worker stopped. No automatic restart.", MessageType.PROFILE))
+                          reloadRecycleView()
+                          refreshSendButtonState()
+                      }
+                  }
+              }''')
+          start = s.index('                    LlmWrapper\n')
+          end = s.index('\n                "multimodal", "vlm" ->', start)
+          s = s[:start] + '''                    try {
+                              val request = Bundle().apply {
+                                  putString("model", selectModelData.modelName)
+                                  putString("runtime", pluginId)
+                                  putString("device", resolvedDeviceId ?: ComputeUnitValue.NPU.value)
+                                  putInt("context", contextTokens)
+                                  putInt("layers", nGpuLayers)
+                                  putBoolean("thinking", enableThinking)
+                              }
+                              textInference.call(InferenceProtocol.LOAD, request) { result ->
+                                  if (result.getString("kind") == "loaded") {
+                                      requestedBackend += " | " + result.getString("text").orEmpty()
+                                  }
+                              }
+                              if (isNativeNpu) loadPrefs.edit().remove("pending_id").remove("pending").commit()
+                              isLoadLlmModel = true
+                              onLoadModelSuccess("Text model loaded in inference worker")
+                          } catch (e: Exception) {
+                              kotlinx.coroutines.withContext(Dispatchers.Main) { textInference.close() }
+                              onLoadModelFailed(e.message ?: "Inference worker load failed")
+                          }
+                      }
+
+          '''.rstrip() + '\n' + s[end:]
+          # The local text configuration is now constructed exclusively by the worker.
+          start = s.index('                    val isQairt = pluginId == "qairt"')
+          end = s.index('                    try {', start)
+          s = s[:start] + s[end:]
+          start = s.index('                        chatList.add(ChatMessage(role = "user", inputString))')
+          end = s.index('\n                    }\n\n                    clearImages()', start)
+          s = s[:start] + '''                        try {
+                                  textInference.call(InferenceProtocol.GENERATE, Bundle().apply {
+                                      putString("prompt", inputString)
+                                      putBoolean("thinking", enableThinking)
+                                  }) { result ->
+                                      when (result.getString("kind")) {
+                                          "token" -> {
+                                              removeLoadingIndicator()
+                                              sb.append(result.getString("text").orEmpty())
+                                              val msg = Message(sb.toString(), MessageType.ASSISTANT)
+                                              if (messages.lastOrNull()?.type == MessageType.ASSISTANT)
+                                                  messages[messages.lastIndex] = msg
+                                              else messages.add(msg)
+                                              adapter.notifyDataSetChanged()
+                                          }
+                                          "profile" -> {
+                                              messages.add(Message(result.getString("text").orEmpty(), MessageType.PROFILE))
+                                              reloadRecycleView()
+                                          }
+                                      }
+                                  }
+                              } catch (e: Exception) {
+                                  runOnUiThread {
+                                      removeLoadingIndicator()
+                                      messages.add(Message("Inference: " + (e.message ?: "failed"), MessageType.PROFILE))
+                                      reloadRecycleView()
+                                  }
+                              }''' + s[end:]
+          replace('llmWrapper.stopStream()\n                    llmWrapper.destroy()\n                    chatList.clear()\n                    handleUnloadResult(0)', '''                    try {
+                                  textInference.call(InferenceProtocol.UNLOAD)
+                                  handleUnloadResult(0)
+                              } catch (e: Exception) {
+                                  kotlinx.coroutines.withContext(Dispatchers.Main) { textInference.close() }
+                                  handleUnloadResult(-1)
+                              }''')
+          replace('llmWrapper.stopStream()', '''                    try { textInference.call(InferenceProtocol.STOP) }
+                              catch (e: Exception) { runOnUiThread { Toast.makeText(this@MainActivity, "Stop failed", Toast.LENGTH_SHORT).show() } }''')
+          replace('llmWrapper.reset()', '''                try { textInference.call(InferenceProtocol.RESET) }
+                          catch (e: Exception) {
+                              kotlinx.coroutines.withContext(Dispatchers.Main) { textInference.close() }
+                              onLoadModelFailed("History reset failed; reload model")
+                          } finally {
+                              isGenerating = false
+                              refreshSendButtonState()
+                          }''')
+          replace('    private fun clearHistory() {\n', '    private fun clearHistory() {\n        if (isGenerating || llLoading.visibility == View.VISIBLE) return\n        if (isLoadLlmModel) { isGenerating = true; refreshSendButtonState() }\n')
+          replace('        btnUnloadModel.setOnClickListener {\n', '        btnUnloadModel.setOnClickListener {\n            if (isGenerating) {\n                Toast.makeText(this, "Stop generation before unloading.", Toast.LENGTH_SHORT).show()\n                return@setOnClickListener\n            }\n')
+          replace('    override fun onDestroy() {', '    override fun onDestroy() {\n        textInference.close()')
+          assert 'llmWrapper.' not in s, 'Local LLM call remained'
+          p.write_text(s)
+          p = Path('src/main/AndroidManifest.xml')
+          s = p.read_text()
+          marker = '        <activity\n            android:name=".MainActivity"'
+          assert s.count(marker) == 1
+          p.write_text(s.replace(marker, '''        <service
+                      android:name=".TextInferenceService"
+                      android:process=":inference"
+                      android:exported="false" />
+          ''' + marker))
+          p = Path('build.gradle')
+          s = p.read_text()
+          assert s.count('versionCode 2') == 1
+          p.write_text(s.replace('versionCode 2', 'versionCode 3').replace("versionName '1.1-dev'", "versionName '1.2-dev'"))
+          PY
+      - name: Add bounded backend comparison and worker memory reporting
+        working-directory: upstream/geniex_chat_android
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          p = Path('src/main/java/com/geniex/demo/MainActivity.kt')
+          s = p.read_text()
+          def replace(old, new):
+              global s
+              assert s.count(old) == 1, old
+              s = s.replace(old, new)
+          replace('private var processMemory = "Sampling process memory..."', '''private var processMemory = "Sampling process memory..."
+              @Volatile private var workerMemory = ""
+              private var benchmarkRunning = false''')
+          replace('binding.tvEngineStatus.text = requestedBackend + "\\n" + processMemory', 'binding.tvEngineStatus.text = requestedBackend + "\\nUI " + processMemory + if (workerMemory.isNotEmpty()) "\\n" + workerMemory else ""')
+          replace('        requestedBackend = "No model loaded"\n        isLoadLlmModel = false', '        requestedBackend = "No model loaded"\n        workerMemory = ""\n        isLoadLlmModel = false')
+          # Callback indentation may vary because the upstream source is patched in earlier steps.
+          marker = 'requestedBackend += " | " + result.getString("text").orEmpty()'
+          i = s.index(marker) + len(marker)
+          j = s.index('}', i)
+          s = s[:j+1] + ' else if (result.getString("kind") == "memory") { workerMemory = result.getString("text").orEmpty() }' + s[j+1:]
+          replace('                                          "profile" -> {', '                                          "memory" -> workerMemory = result.getString("text").orEmpty()\n                                          "profile" -> {') if s.count('                                          "profile" -> {') == 1 else replace('"profile" -> {', '"memory" -> workerMemory = result.getString("text").orEmpty()\n                                          "profile" -> {')
+          replace('btnDownload.setOnClickListener {', 'btnDownload.setOnClickListener {\n            if (benchmarkRunning) return@setOnClickListener')
+          replace('btnLoadModel.setOnClickListener {', 'btnLoadModel.setOnClickListener {\n            if (benchmarkRunning) return@setOnClickListener')
+          replace('private fun showModelInventory() {', 'private fun showModelInventory() {\n        if (benchmarkRunning) return')
+          replace('private fun clearHistory() {', 'private fun clearHistory() {\n        if (benchmarkRunning) return')
+          replace('        observeDownloads()\n', '        observeDownloads()\n        binding.btnBenchmark.setOnClickListener { offerBenchmark() }\n')
+          marker = '    private fun resetLoadState() {'
+          replace(marker, '''    private fun offerBenchmark() {
+                  if (benchmarkRunning || managingModels || hasLoadedModel() || isGenerating ||
+                      ModelDownloadService.state.value.busy || llLoading.visibility == View.VISIBLE) {
+                      Toast.makeText(this, "Unload the model and finish downloads first.", Toast.LENGTH_SHORT).show()
+                      return
+                  }
+                  val model = modelList.firstOrNull { it.id == selectModelId }
+                  if (model?.id != "Qwen3-0.6B-GGUF") {
+                      Toast.makeText(this, "Select the tested Qwen3-0.6B GGUF first.", Toast.LENGTH_LONG).show()
+                      return
+                  }
+                  AlertDialog.Builder(this)
+                      .setTitle("Compare CPU / GPU / NPU")
+                      .setMessage("Three sequential runs of the same short prompt, context 1024, up to 64 output tokens. Actual hardware placement is unverified. Stops on error or low available RAM. Keep app open.")
+                      .setNegativeButton("Cancel", null)
+                      .setPositiveButton("Run") { _, _ -> runBackendBenchmark(model) }
+                      .show()
+              }
+
+              private fun runBackendBenchmark(model: ModelData) {
+                  if (benchmarkRunning || managingModels || hasLoadedModel() || isGenerating ||
+                      ModelDownloadService.state.value.busy || llLoading.visibility == View.VISIBLE) return
+                  benchmarkRunning = true
+                  binding.btnBenchmark.isEnabled = false
+                  spModelList.isEnabled = false
+                  val results = StringBuilder()
+                  modelScope.launch(Dispatchers.Main) {
+                      try {
+                          check(kotlinx.coroutines.withContext(Dispatchers.IO) { isModelDownloaded(model) }) { "Download the model first." }
+                          val manager = getSystemService(Context.ACTIVITY_SERVICE) as android.app.ActivityManager
+                          val prompt = "List five common fruits and their colors. Use short sentences."
+                          val choices = listOf("CPU" to ComputeUnitValue.CPU.value, "GPU" to ComputeUnitValue.GPU.value, "NPU" to ComputeUnitValue.NPU.value)
+                          for ((label, device) in choices) {
+                              val mem = android.app.ActivityManager.MemoryInfo()
+                              manager.getMemoryInfo(mem)
+                              check(!mem.lowMemory && mem.availMem >= 2L * 1073741824L) { "Insufficient available RAM before " + label }
+                              requestedBackend = "Benchmark: " + label + " requested; actual placement unverified"
+                              binding.btnBenchmark.text = "Testing " + label
+                              val begin = android.os.SystemClock.elapsedRealtime()
+                              textInference.call(InferenceProtocol.LOAD, Bundle().apply {
+                                  putString("model", model.modelName)
+                                  putString("runtime", "llama_cpp")
+                                  putString("device", device)
+                                  putInt("layers", if (label == "CPU") 0 else 999)
+                                  putInt("context", 1024)
+                                  putBoolean("thinking", false)
+                              }) { if (it.getString("kind") == "memory") workerMemory = it.getString("text").orEmpty() }
+                              val loadMs = android.os.SystemClock.elapsedRealtime() - begin
+                              val loadMemory = workerMemory
+                              var profile = ""
+                              textInference.call(InferenceProtocol.GENERATE, Bundle().apply {
+                                  putString("prompt", prompt)
+                                  putBoolean("thinking", false)
+                                  putInt("maxTokens", 64)
+                              }) {
+                                  when (it.getString("kind")) {
+                                      "profile" -> profile = it.getString("text").orEmpty()
+                                      "memory" -> workerMemory = it.getString("text").orEmpty()
+                                  }
+                              }
+                              results.append(label).append(" requested | load ").append(loadMs).append(" ms\\n")
+                                  .append(profile).append("\\nAt load: ").append(loadMemory)
+                                  .append("\\nAfter generation: ").append(workerMemory).append("\\n\\n")
+                              textInference.call(InferenceProtocol.UNLOAD)
+                              textInference.close()
+                              kotlinx.coroutines.delay(1500)
+                          }
+                      } catch (e: Exception) {
+                          results.append("Stopped: ").append(e.message ?: e.javaClass.simpleName)
+                      } finally {
+                          textInference.close()
+                          benchmarkRunning = false
+                          binding.btnBenchmark.isEnabled = true
+                          binding.btnBenchmark.text = "Benchmark CPU / GPU / NPU"
+                          spModelList.isEnabled = true
+                          resetLoadState()
+                          if (!isFinishing && !isDestroyed) {
+                              val report = "Qwen3-0.6B | context 1024 | output cap 64 | requested devices only\\n\\n" + results
+                              AlertDialog.Builder(this@MainActivity).setTitle("Benchmark results").setMessage(report)
+                                  .setNeutralButton("Copy") { _, _ ->
+                                      val clipboard = getSystemService(Context.CLIPBOARD_SERVICE) as android.content.ClipboardManager
+                                      clipboard.setPrimaryClip(android.content.ClipData.newPlainText("Tovarish benchmark", report))
+                                  }.setPositiveButton("Close", null).show()
+                          }
+                      }
+                  }
+              }
+
+          ''' + marker)
+          p.write_text(s)
+          p = Path('src/main/res/layout/activity_main.xml')
+          x = p.read_text()
+          marker = '        <!-- Control buttons section -->'
+          assert x.count(marker) == 1
+          p.write_text(x.replace(marker, '''        <Button
+                      android:id="@+id/btn_benchmark"
+                      android:layout_width="match_parent"
+                      android:layout_height="wrap_content"
+                      android:text="Benchmark CPU / GPU / NPU"
+                      android:textAllCaps="false"
+                      android:textColor="#F2F2F3"
+                      android:backgroundTint="#242424" />
+
+          ''' + marker))
+          p = Path('build.gradle')
+          x = p.read_text()
+          assert x.count('versionCode 3') == 1
+          p.write_text(x.replace('versionCode 3', 'versionCode 4').replace("versionName '1.2-dev'", "versionName '1.3-dev'"))
+          PY
+      - name: Add repeated energy benchmark and thermal safeguards
+        working-directory: upstream/geniex_chat_android
+        run: |
+          cp ../../tovarish/android-overrides/BatteryEnergyProbe.kt src/main/java/com/geniex/demo/
+          cp ../../tovarish/android-overrides/EnergyWindowTest.kt src/test/java/com/geniex/demo/
+          python - <<'PY'
+          from pathlib import Path
+          p = Path('src/main/java/com/geniex/demo/MainActivity.kt')
+          s = p.read_text()
+          def replace(old, new):
+              global s
+              assert s.count(old) == 1, old
+              s = s.replace(old, new)
+          replace('private var benchmarkRunning = false', '''private var benchmarkRunning = false
+              private var energyBenchmarkJob: Job? = null''')
+          replace('binding.btnBenchmark.setOnClickListener { offerBenchmark() }', '''binding.btnBenchmark.setOnClickListener {
+                  if (benchmarkRunning) energyBenchmarkJob?.cancel() else offerBenchmark()
+              }''')
+          replace('override fun onStop() {', 'override fun onStop() {\n        energyBenchmarkJob?.cancel()')
+          replace('Three sequential runs of the same short prompt, context 1024, up to 64 output tokens. Actual hardware placement is unverified. Stops on error or low available RAM. Keep app open.', '60-second idle sensor calibration, then three rounds rotating CPU/GPU/NPU; short requests, context 1024, output cap 64. Measures whole-phone battery power, not accelerator power. Disconnect charger and keep brightness unchanged. Stops on low RAM, thermal stress or leaving app. Tap benchmark button to cancel.')
+          start = s.index('private fun runBackendBenchmark(model: ModelData) {')
+          end = s.index('private fun resetLoadState()', start)
+          s = s[:start] + '''private fun runBackendBenchmark(model: ModelData) {
+                  if (benchmarkRunning || managingModels || hasLoadedModel() || isGenerating ||
+                      ModelDownloadService.state.value.busy || llLoading.visibility == View.VISIBLE) return
+                  benchmarkRunning = true
+                  spModelList.isEnabled = false
+                  binding.btnBenchmark.text = "Cancel benchmark"
+                  val results = StringBuilder()
+                  energyBenchmarkJob = modelScope.launch(Dispatchers.Main) {
+                      val probe = BatteryEnergyProbe(this@MainActivity)
+                      val manager = getSystemService(Context.ACTIVITY_SERVICE) as android.app.ActivityManager
+                      val choices = listOf("CPU" to ComputeUnitValue.CPU.value, "GPU" to ComputeUnitValue.GPU.value, "NPU" to ComputeUnitValue.NPU.value)
+                      fun checkConditions(sample: EnergySample) {
+                          probe.stopReason(sample)?.let { error(it) }
+                          val mem = android.app.ActivityManager.MemoryInfo()
+                          manager.getMemoryInfo(mem)
+                          check(!mem.lowMemory && mem.availMem >= 2L * 1073741824L) { "Insufficient available RAM" }
+                      }
+                      suspend fun sample() = kotlinx.coroutines.withContext(Dispatchers.IO) { probe.sample() }
+                      suspend fun measured(window: EnergyWindow, operation: suspend () -> Unit) = kotlinx.coroutines.coroutineScope {
+                          val initial = sample()
+                          checkConditions(initial)
+                          window.add(initial)
+                          val monitor = launch {
+                              while (true) {
+                                  kotlinx.coroutines.delay(500)
+                                  val reading = sample()
+                                  checkConditions(reading)
+                                  window.add(reading)
+                              }
+                          }
+                          try { operation() } finally {
+                              monitor.cancel()
+                              monitor.join()
+                          }
+                          val final = sample()
+                          checkConditions(final)
+                          window.add(final)
+                      }
+                      try {
+                          check(kotlinx.coroutines.withContext(Dispatchers.IO) { isModelDownloaded(model) }) { "Download the model first." }
+                          val baseline = EnergyWindow()
+                          requestedBackend = "Energy benchmark: idle baseline"
+                          measured(baseline) { kotlinx.coroutines.delay(60000) }
+                          val currentScale = baseline.inferredScale()
+                          results.append("60-second idle calibration:\\n").append(baseline.report(scale = currentScale)).append("\\n\\n")
+                          check(currentScale != null) { "Current units not corroborated by charge counter; send diagnostic report. Skipping repeated load." }
+                          for (round in 0..2) {
+                              for (index in 0..2) {
+                                  val (label, device) = choices[(round + index) % 3]
+                                  requestedBackend = "Energy benchmark " + (round + 1) + "/3: " + label + " requested"
+                                  binding.btnBenchmark.text = "Cancel " + label + " " + (round + 1) + "/3"
+                                  checkConditions(sample())
+                                  val startLoad = android.os.SystemClock.elapsedRealtime()
+                                  val loadWindow = EnergyWindow()
+                                  measured(loadWindow) {
+                                      kotlinx.coroutines.withTimeout(30_000) {
+                                          textInference.call(InferenceProtocol.LOAD, Bundle().apply {
+                                      putString("model", model.modelName)
+                                      putString("runtime", "llama_cpp")
+                                      putString("device", device)
+                                      putInt("layers", if (label == "CPU") 0 else 999)
+                                      putInt("context", 1024)
+                                      putBoolean("thinking", false)
+                                          }) { if (it.getString("kind") == "memory") workerMemory = it.getString("text").orEmpty() }
+                                      }
+                                  }
+                                  val loadMs = android.os.SystemClock.elapsedRealtime() - startLoad
+                                  val window = EnergyWindow()
+                                  var tokens = 0
+                                  var passes = 0
+                                  val speeds = mutableListOf<Double>()
+                                  val prompt = "List ten common fruits, each with its color and one short fact."
+                                  measured(window) {
+                                      val begin = android.os.SystemClock.elapsedRealtime()
+                                      do {
+                                          checkConditions(sample())
+                                          textInference.call(InferenceProtocol.RESET)
+                                          var profile = ""
+                                          kotlinx.coroutines.withTimeout(15_000) {
+                                          textInference.call(InferenceProtocol.GENERATE, Bundle().apply {
+                                              putString("prompt", prompt)
+                                              putBoolean("thinking", false)
+                                              putInt("maxTokens", 64)
+                                          }) {
+                                              when (it.getString("kind")) {
+                                                  "profile" -> profile = it.getString("text").orEmpty()
+                                                  "memory" -> workerMemory = it.getString("text").orEmpty()
+                                              }
+                                          }
+                                          }
+                                          val generated = Regex("Generated Tokens: ([0-9]+)").find(profile)?.groupValues?.get(1)?.toIntOrNull()
+                                          check(generated != null && generated > 0) { "No valid token count from SDK" }
+                                          tokens += generated
+                                          Regex("Decoding Speed: ([0-9.]+)").find(profile)?.groupValues?.get(1)?.toDoubleOrNull()?.let { speeds.add(it) }
+                                          passes++
+                                      } while (android.os.SystemClock.elapsedRealtime() - begin < 8000 && passes < 40)
+                                  }
+                                  results.append("Round ").append(round + 1).append(" | ").append(label).append(" requested | load ").append(loadMs).append(" ms\\n")
+                                      .append("Requests: ").append(passes).append(" | generated tokens: ").append(tokens)
+                                      .append(" | mean SDK decode tok/s: ").append(if (speeds.isEmpty()) "unavailable" else String.format(Locale.US, "%.2f", speeds.average()))
+                                      .append("\\n").append(window.report(tokens, currentScale)).append("\\n").append(workerMemory).append("\\n\\n")
+                                  textInference.call(InferenceProtocol.UNLOAD)
+                                  textInference.close()
+                                  kotlinx.coroutines.delay(5000)
+                              }
+                          }
+                      } catch (e: kotlinx.coroutines.CancellationException) {
+                          results.append("Cancelled. Only completed windows are reported.")
+                      } catch (e: Exception) {
+                          results.append("Stopped: ").append(e.message ?: e.javaClass.simpleName)
+                      } finally {
+                          textInference.close()
+                          benchmarkRunning = false
+                          energyBenchmarkJob = null
+                          binding.btnBenchmark.text = "Energy benchmark CPU / GPU / NPU"
+                          spModelList.isEnabled = true
+                          resetLoadState()
+                          if (!isFinishing && !isDestroyed && hasWindowFocus()) {
+                              val report = "Qwen3-0.6B | context 1024 | output cap 64 | whole-device energy estimate | requested devices only\\nLoad excluded; repeated reset/prefill/generation included. No accelerator-only measurement.\\n\\n" + results
+                              AlertDialog.Builder(this@MainActivity).setTitle("Energy benchmark results").setMessage(report)
+                                  .setNeutralButton("Copy") { _, _ ->
+                                      val clipboard = getSystemService(Context.CLIPBOARD_SERVICE) as android.content.ClipboardManager
+                                      clipboard.setPrimaryClip(android.content.ClipData.newPlainText("Tovarish energy benchmark", report))
+                                  }.setPositiveButton("Close", null).show()
+                          }
+                      }
+                  }
+              }
+
+              ''' + s[end:]
+          p.write_text(s)
+          p = Path('src/main/res/layout/activity_main.xml')
+          x = p.read_text()
+          marker = 'android:text="Benchmark CPU / GPU / NPU"'
+          assert x.count(marker) == 1
+          p.write_text(x.replace(marker, 'android:text="Energy benchmark CPU / GPU / NPU"'))
+          p = Path('build.gradle')
+          x = p.read_text()
+          assert x.count('versionCode 4') == 1
+          p.write_text(x.replace('versionCode 4', 'versionCode 7').replace("versionName '1.3-dev'", "versionName '1.4.2-dev'"))
+          PY
+      - name: Expand text benchmark and add persistent results
+        working-directory: upstream/geniex_chat_android
+        run: |
+          cp ../../tovarish/android-overrides/BenchmarkHistory.kt src/main/java/com/geniex/demo/
+          python - <<'PY'
+          from pathlib import Path
+          import json
+          p = Path('src/main/assets/model_list.json')
+          models = json.loads(p.read_text())
+          for name in ('Qwen3-0.6B', 'Qwen3-1.7B'):
+              assert all(m['id'] != name for m in models)
+              models.append(dict(id=name, displayName=name+' (QAIRT, NPU)', modelName='ai-hub-models/'+name,
+                                 aiHubDisplayName=name, hub='AUTO', type='chat', runtime='qairt', chipset='SM8750'))
+          p.write_text(json.dumps(models, indent=2))
+          p = Path('src/main/java/com/geniex/demo/MainActivity.kt')
+          s = p.read_text()
+          def replace(old, new):
+              global s
+              assert s.count(old) == 1, old
+              s = s.replace(old, new)
+          replace('if (model?.id != "Qwen3-0.6B-GGUF") {', 'if (model == null || model.type !in setOf("chat", "llm") || model.runtime !in setOf("llama_cpp", "qairt")) {')
+          replace('Select the tested Qwen3-0.6B GGUF first.', 'Select a supported text model. Vision models are not benchmarked yet.')
+          start = s.index('AlertDialog.Builder(this)', s.index('private fun offerBenchmark()'))
+          end = s.index('private fun runBackendBenchmark', start)
+          s = s[:start] + '''val options = if (model.runtime == "qairt") listOf("NPU") else listOf("CPU", "GPU", "NPU")
+                  val checked = BooleanArray(options.size) { true }
+                  val energy = android.widget.CheckBox(this).apply {
+                      text = "Attempt optional 60-second battery calibration"
+                      isChecked = false
+                      setPadding(24, 8, 24, 8)
+                  }
+                  AlertDialog.Builder(this)
+                      .setTitle("Benchmark " + model.displayName)
+                      .setMultiChoiceItems(options.toTypedArray(), checked) { _, index, value -> checked[index] = value }
+                      .setView(energy)
+                      .setNegativeButton("Cancel", null)
+                      .setPositiveButton("Run") { _, _ ->
+                          val selected = options.filterIndexed { index, _ -> checked[index] }
+                          if (selected.isNotEmpty()) runBackendBenchmark(model, selected, energy.isChecked)
+                      }.show()
+              }
+
+              ''' + s[end:]
+          replace('private fun runBackendBenchmark(model: ModelData) {', 'private fun runBackendBenchmark(model: ModelData, selected: List<String>, energyEnabled: Boolean) {')
+          replace('val choices = listOf("CPU" to ComputeUnitValue.CPU.value, "GPU" to ComputeUnitValue.GPU.value, "NPU" to ComputeUnitValue.NPU.value)', '''val choices = listOf("CPU" to ComputeUnitValue.CPU.value, "GPU" to ComputeUnitValue.GPU.value, "NPU" to ComputeUnitValue.NPU.value).filter { it.first in selected }
+                      val native = model.runtime == "qairt"
+                      val rows = org.json.JSONArray()
+                      val timestamp = System.currentTimeMillis()
+                      val prefs = getSharedPreferences("native_load", MODE_PRIVATE)
+                      var nativePending = false''')
+          replace('check(!mem.lowMemory && mem.availMem >= 2L * 1073741824L) { "Insufficient available RAM" }', '''check(!mem.lowMemory && mem.availMem >= (if (native) 5L else 2L) * 1073741824L) { "Insufficient available RAM (conservative preflight)" }''')
+          start = s.index('val baseline = EnergyWindow()', s.index('private fun runBackendBenchmark'))
+          end = s.index('requestedBackend = "Energy benchmark " ', start)
+          s = s[:start] + '''var currentScale: Double? = null
+                          if (energyEnabled) {
+                              val baseline = EnergyWindow()
+                              requestedBackend = "Energy benchmark: idle baseline"
+                              measured(baseline) { kotlinx.coroutines.delay(60000) }
+                              currentScale = baseline.inferredScale()
+                              results.append("60-second idle calibration:\\n").append(baseline.report(scale = currentScale)).append("\\n\\n")
+                              if (currentScale == null) results.append("Energy unavailable; performance test continues.\\n\\n")
+                          }
+                          if (native) {
+                              check(model.chipset == android.os.Build.SOC_MODEL.trim().uppercase(Locale.US)) { "Chipset mismatch" }
+                              check(prefs.getString("pending_id", null) == null) { "Previous native load interrupted; diagnosis required" }
+                              val paths = kotlinx.coroutines.withContext(Dispatchers.IO) { ModelManagerWrapper.getPaths(model.modelName) }
+                                  ?: error("Model not downloaded")
+                              check(paths.runtime_id == "qairt") { "Unexpected runtime in cache" }
+                              val file = File(paths.model_path)
+                              val dir = if (file.isDirectory) file else file.parentFile
+                              val weights = dir?.listFiles()?.filter { it.isFile && it.name.endsWith(".bin", true) }?.sumOf { it.length() } ?: 0L
+                              val mem = android.app.ActivityManager.MemoryInfo()
+                              manager.getMemoryInfo(mem)
+                              val minimum = maxOf(5L * 1073741824L, weights + 1610612736L, mem.threshold + 1073741824L)
+                              check(mem.availMem >= minimum && !mem.lowMemory) { "QAIRT RAM preflight blocked: available " + (mem.availMem / 1048576) + " MiB; required " + (minimum / 1048576) + " MiB (provisional)" }
+                          }
+                          for (round in 0..2) {
+                              for (index in choices.indices) {
+                                  val (label, device) = choices[(round + index) % choices.size]
+                                  ''' + s[end:]
+          # Escape Kotlin newlines introduced by Python triple quoted strings.
+          # Native load marker uses the existing preferences; clear only after successful unload.
+          marker = 'val startLoad = android.os.SystemClock.elapsedRealtime()'
+          replace(marker, '''if (native) {
+                                      check(prefs.edit().putString("pending_id", model.id)
+                                          .putString("pending", model.displayName + " | benchmark | " + java.util.Date()).commit())
+                                      nativePending = true
+                                  }
+                                  ''' + marker)
+          start = s.index('private fun runBackendBenchmark')
+          end = s.index('private fun resetLoadState()', start)
+          b = s[start:end]
+          assert b.count('putString("runtime", "llama_cpp")') == 1
+          b = b.replace('putString("runtime", "llama_cpp")', 'putString("runtime", model.runtime ?: "llama_cpp")')
+          b = b.replace('putInt("context", 1024)', 'putInt("context", if (native) 0 else 1024)')
+          b = b.replace('putInt("layers", if (label == "CPU") 0 else 999)', 'putInt("layers", if (native || label == "CPU") 0 else 999)')
+          b = b.replace('kotlinx.coroutines.withTimeout(30_000)', 'kotlinx.coroutines.withTimeout(60_000)')
+          b = b.replace('kotlinx.coroutines.withTimeout(15_000)', 'kotlinx.coroutines.withTimeout(30_000)')
+          marker = 'textInference.call(InferenceProtocol.UNLOAD)'
+          assert b.count(marker) == 1
+          b = b.replace(marker, '''rows.put(org.json.JSONObject().apply {
+                                      put("round", round + 1)
+                                      put("device", label)
+                                      put("load_ms", loadMs)
+                                      put("tokens", tokens)
+                                      put("seconds", window.seconds)
+                                      if (speeds.isNotEmpty()) put("decode", speeds.average())
+                                      Regex("Worker PSS ([0-9]+)").find(workerMemory)?.groupValues?.get(1)?.toLongOrNull()?.let { put("pss", it) }
+                                      put("memory_report", workerMemory)
+                                      put("energy_report", window.report(tokens, currentScale))
+                                  })
+                                  textInference.call(InferenceProtocol.UNLOAD)
+                                  if (nativePending) {
+                                      check(prefs.edit().remove("pending_id").remove("pending").commit())
+                                      nativePending = false
+                                  }''')
+          # Move report persistence outside the visibility check, including partial runs.
+          old = 'if (!isFinishing && !isDestroyed && hasWindowFocus()) {'
+          assert b.count(old) == 1
+          pos = b.index(old)
+          report_start = b.index('val report = ', pos)
+          report_end = b.index('\n', report_start)
+          b = b[:pos] + '''val report = model.displayName + " | runtime " + model.runtime +
+                                  " | context " + (if (native) "compiled" else "1024") +
+                                  " | output cap 64 | requested devices only\\\\nLoad excluded from generation window.\\\\n\\\\n" + results
+                              val saved = runCatching {
+                                  BenchmarkHistory(this@MainActivity).save(org.json.JSONObject().apply {
+                                      put("timestamp", timestamp)
+                                      put("model", model.id)
+                                      put("runtime", model.runtime)
+                                      put("quant", model.quant ?: "bundle-selected")
+                                      put("context", if (native) "compiled" else "1024")
+                                      put("sdk", "0.3.5")
+                                      put("protocol", "1.5-repeated-64")
+                                      put("soc", android.os.Build.SOC_MODEL)
+                                      put("runs", rows)
+                                      put("report", report)
+                                  })
+                              }.isSuccess
+                              if (!isFinishing && !isDestroyed && hasWindowFocus()) {
+                                  val displayReport = report + if (saved) "\\\\nSaved to local history." else "\\\\nHistory save failed."
+                              ''' + b[report_end:]
+          b = b.replace('.setMessage(report)', '.setMessage(displayReport)').replace('newPlainText("Tovarish energy benchmark", report)', 'newPlainText("Tovarish benchmark", displayReport)')
+          # These three lines were authored in the earlier replacement using Python escapes.
+          b = b.replace('calibration:\n").append', 'calibration:\\n").append').replace('.append("\n\n")', '.append("\\n\\n")').replace('continues.\n\n")', 'continues.\\n\\n")')
+          s = s[:start] + b + s[end:]
+          replace('binding.btnBenchmark.text = "Energy benchmark CPU / GPU / NPU"', 'binding.btnBenchmark.text = "Benchmark selected model"')
+          replace('binding.btnBenchmark.setOnClickListener {', '''binding.btnBenchmarkHistory.setOnClickListener { showBenchmarkHistory() }
+                  binding.btnBenchmark.setOnClickListener {''')
+          replace('private fun offerBenchmark() {', '''private fun showBenchmarkHistory() {
+                  if (benchmarkRunning) return
+                  val history = BenchmarkHistory(this)
+                  val records = history.records()
+                  if (records.isEmpty()) {
+                      Toast.makeText(this, "No saved benchmarks yet.", Toast.LENGTH_SHORT).show()
+                      return
+                  }
+                  val labels = listOf("Compare latest configurations") + records.map {
+                      it.optString("model") + " | " + java.util.Date(it.optLong("timestamp"))
+                  }
+                  AlertDialog.Builder(this).setTitle("Benchmark history").setItems(labels.toTypedArray()) { _, index ->
+                      val report = if (index == 0) history.comparison(records) else records[index-1].optString("report")
+                      AlertDialog.Builder(this).setTitle(labels[index]).setMessage(report)
+                          .setNeutralButton("Copy") { _, _ ->
+                              val clipboard = getSystemService(Context.CLIPBOARD_SERVICE) as android.content.ClipboardManager
+                              clipboard.setPrimaryClip(android.content.ClipData.newPlainText("Benchmark", report))
+                          }.setPositiveButton("Close", null).show()
+                  }.show()
+              }
+
+              private fun offerBenchmark() {''')
+          p.write_text(s)
+          p = Path('src/main/res/layout/activity_main.xml')
+          x = p.read_text()
+          marker = 'android:text="Energy benchmark CPU / GPU / NPU"'
+          assert x.count(marker) == 1
+          x = x.replace(marker, 'android:text="Benchmark selected model"')
+          marker = '        <!-- Control buttons section -->'
+          assert x.count(marker) == 1
+          p.write_text(x.replace(marker, '''        <Button
+                      android:id="@+id/btn_benchmark_history"
+                      android:layout_width="match_parent"
+                      android:layout_height="wrap_content"
+                      android:text="Benchmark history"
+                      android:textAllCaps="false"
+                      android:textColor="#F2F2F3"
+                      android:backgroundTint="#242424" />
+
+          ''' + marker))
+          p = Path('build.gradle')
+          x = p.read_text()
+          assert x.count('versionCode 7') == 1
+          p.write_text(x.replace('versionCode 7', 'versionCode 8').replace("versionName '1.4.2-dev'", "versionName '1.5-dev'"))
+          PY
+      - name: Build debug APK
+        working-directory: upstream/geniex_chat_android
+        run: gradle --no-daemon testDebugUnitTest assembleDebug
+      - name: Package test artifact and provenance
+        run: |
+          set -euo pipefail
+          mkdir -p out
+          # This public development key is deliberately NOT a production signing key.
+          # The development package must never share an ID or certificate with production.
+          umask 077
+          keyfile="$(mktemp "$RUNNER_TEMP/tovarish-signing.XXXXXX")"
+          trap 'rm -f "$keyfile"' EXIT
+          base64 --decode tovarish/.github/keys/tovarish-public-development.p12.b64 > "$keyfile"
+          EXPECTED=f6bac2653b36a419baa0fe5ab3fd5526bb958dd8ee8332c1ec0fe7ae1d0602bc
+          ACTUAL=$(keytool -exportcert -keystore "$keyfile" -storetype PKCS12 -alias tovarish-dev-public -storepass android | sha256sum | cut -d' ' -f1)
+          test "$ACTUAL" = "$EXPECTED"
+          "$ANDROID_HOME/build-tools/34.0.0/apksigner" sign --ks "$keyfile" --ks-type PKCS12 --ks-key-alias tovarish-dev-public --ks-pass pass:android --key-pass pass:android --out out/Tovarish-Test-debug.apk upstream/geniex_chat_android/build/outputs/apk/debug/app-debug.apk
+          ACTUAL=$("$ANDROID_HOME/build-tools/34.0.0/apksigner" verify --print-certs out/Tovarish-Test-debug.apk | sed -n 's/^Signer #1 certificate SHA-256 digest: //p')
+          test "$ACTUAL" = "$EXPECTED"
+          rm -f out/*.idsig
+          cp upstream/LICENSE out/QUALCOMM-LICENSE.txt
+          git -C upstream rev-parse HEAD > out/upstream-commit.txt
+          "$ANDROID_HOME/build-tools/34.0.0/aapt" dump badging out/Tovarish-Test-debug.apk > out/apk-info.txt
+          grep -F "application-label:'Tovarish Dev'" out/apk-info.txt
+          grep -F "package: name='com.geniex.demo.tovarish.stabletest'" out/apk-info.txt
+          "$ANDROID_HOME/build-tools/34.0.0/apksigner" verify --verbose --print-certs out/Tovarish-Test-debug.apk
+          (cd out && sha256sum Tovarish-Test-debug.apk > SHA256SUMS.txt)
+          du -h out/*
+          echo "APK bytes: $(stat -c %s out/Tovarish-Test-debug.apk)" >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        id: artifact
+        continue-on-error: true
+        with:
+          name: Tovarish-download-diagnostics
+          path: out/
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 0
+      - name: Save private draft release if artifact upload fails
+        if: steps.artifact.outcome == 'failure' && github.event.repository.private == true
+        env:
+          GH_TOKEN: ${{ github.token }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          set -euo pipefail
+          test "$(gh api "repos/$GITHUB_REPOSITORY" --jq .private)" = true
+          tag="baseline-test-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          gh release create "$tag" out/* --repo "$GITHUB_REPOSITORY" --draft --target "$HEAD_SHA" --title "Tovarish private baseline test" --notes "Unpublished test build. APK signature verified; see SHA256SUMS.txt. No device validation yet."
+          gh release view "$tag" --repo "$GITHUB_REPOSITORY" --json isDraft,assets,url > /tmp/tovarish-release.json
+          python - <<'PY'
+          import json
+          from pathlib import Path
+          r = json.loads(Path('/tmp/tovarish-release.json').read_text())
+          assert r['isDraft'], 'Expected an unpublished draft'
+          assert {p.name for p in Path('out').iterdir()} <= {a['name'] for a in r['assets']}
+          print(r['url'])
+          PY
+          echo "Private draft download: $(gh release view "$tag" --repo "$GITHUB_REPOSITORY" --json url --jq .url)" >> "$GITHUB_STEP_SUMMARY"
+      - name: Require successful artifact upload for public repository
+        if: steps.artifact.outcome == 'failure' && github.event.repository.private == false
+        run: |
+          echo "::error::Public Actions artifact upload failed; inspect quota and upload logs."
+          exit 1
+      - name: Report artifact link
+        if: steps.artifact.outcome == 'success'
+        run: echo "APK artifact available in this workflow run." >> "$GITHUB_STEP_SUMMARY"
