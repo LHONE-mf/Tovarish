@@ -1134,6 +1134,160 @@ jobs:
           assert x.count('versionCode 3') == 1
           p.write_text(x.replace('versionCode 3', 'versionCode 4').replace("versionName '1.2-dev'", "versionName '1.3-dev'"))
           PY
+      - name: Add repeated energy benchmark and thermal safeguards
+        working-directory: upstream/geniex_chat_android
+        run: |
+          cp ../../tovarish/android-overrides/BatteryEnergyProbe.kt src/main/java/com/geniex/demo/
+          cp ../../tovarish/android-overrides/EnergyWindowTest.kt src/test/java/com/geniex/demo/
+          python - <<'PY'
+          from pathlib import Path
+          p = Path('src/main/java/com/geniex/demo/MainActivity.kt')
+          s = p.read_text()
+          def replace(old, new):
+              global s
+              assert s.count(old) == 1, old
+              s = s.replace(old, new)
+          replace('private var benchmarkRunning = false', '''private var benchmarkRunning = false
+              private var energyBenchmarkJob: Job? = null''')
+          replace('binding.btnBenchmark.setOnClickListener { offerBenchmark() }', '''binding.btnBenchmark.setOnClickListener {
+                  if (benchmarkRunning) energyBenchmarkJob?.cancel() else offerBenchmark()
+              }''')
+          replace('override fun onStop() {', 'override fun onStop() {\n        energyBenchmarkJob?.cancel()')
+          replace('Three sequential runs of the same short prompt, context 1024, up to 64 output tokens. Actual hardware placement is unverified. Stops on error or low available RAM. Keep app open.', 'Three rounds, rotating CPU/GPU/NPU order; short repeated requests, context 1024, output cap 64. Measures whole-phone battery power, not accelerator power. Disconnect charger and keep brightness unchanged. Stops on low RAM, thermal stress or leaving app. Tap benchmark button to cancel.')
+          start = s.index('private fun runBackendBenchmark(model: ModelData) {')
+          end = s.index('private fun resetLoadState()', start)
+          s = s[:start] + '''private fun runBackendBenchmark(model: ModelData) {
+                  if (benchmarkRunning || managingModels || hasLoadedModel() || isGenerating ||
+                      ModelDownloadService.state.value.busy || llLoading.visibility == View.VISIBLE) return
+                  benchmarkRunning = true
+                  spModelList.isEnabled = false
+                  binding.btnBenchmark.text = "Cancel benchmark"
+                  val results = StringBuilder()
+                  energyBenchmarkJob = modelScope.launch(Dispatchers.Main) {
+                      val probe = BatteryEnergyProbe(this@MainActivity)
+                      val manager = getSystemService(Context.ACTIVITY_SERVICE) as android.app.ActivityManager
+                      val choices = listOf("CPU" to ComputeUnitValue.CPU.value, "GPU" to ComputeUnitValue.GPU.value, "NPU" to ComputeUnitValue.NPU.value)
+                      fun checkConditions(sample: EnergySample) {
+                          probe.stopReason(sample)?.let { error(it) }
+                          val mem = android.app.ActivityManager.MemoryInfo()
+                          manager.getMemoryInfo(mem)
+                          check(!mem.lowMemory && mem.availMem >= 2L * 1073741824L) { "Insufficient available RAM" }
+                      }
+                      suspend fun sample() = kotlinx.coroutines.withContext(Dispatchers.IO) { probe.sample() }
+                      suspend fun measured(window: EnergyWindow, operation: suspend () -> Unit) = kotlinx.coroutines.coroutineScope {
+                          val initial = sample()
+                          checkConditions(initial)
+                          window.add(initial)
+                          val monitor = launch {
+                              while (true) {
+                                  kotlinx.coroutines.delay(500)
+                                  val reading = sample()
+                                  checkConditions(reading)
+                                  window.add(reading)
+                              }
+                          }
+                          try { operation() } finally {
+                              monitor.cancel()
+                              monitor.join()
+                          }
+                          val final = sample()
+                          checkConditions(final)
+                          window.add(final)
+                      }
+                      try {
+                          check(kotlinx.coroutines.withContext(Dispatchers.IO) { isModelDownloaded(model) }) { "Download the model first." }
+                          val baseline = EnergyWindow()
+                          requestedBackend = "Energy benchmark: idle baseline"
+                          measured(baseline) { kotlinx.coroutines.delay(6000) }
+                          results.append("Idle baseline:\\n").append(baseline.report()).append("\\n\\n")
+                          for (round in 0..2) {
+                              for (index in 0..2) {
+                                  val (label, device) = choices[(round + index) % 3]
+                                  requestedBackend = "Energy benchmark " + (round + 1) + "/3: " + label + " requested"
+                                  binding.btnBenchmark.text = "Cancel " + label + " " + (round + 1) + "/3"
+                                  checkConditions(sample())
+                                  val startLoad = android.os.SystemClock.elapsedRealtime()
+                                  textInference.call(InferenceProtocol.LOAD, Bundle().apply {
+                                      putString("model", model.modelName)
+                                      putString("runtime", "llama_cpp")
+                                      putString("device", device)
+                                      putInt("layers", if (label == "CPU") 0 else 999)
+                                      putInt("context", 1024)
+                                      putBoolean("thinking", false)
+                                  }) { if (it.getString("kind") == "memory") workerMemory = it.getString("text").orEmpty() }
+                                  val loadMs = android.os.SystemClock.elapsedRealtime() - startLoad
+                                  val window = EnergyWindow()
+                                  var tokens = 0
+                                  var passes = 0
+                                  val speeds = mutableListOf<Double>()
+                                  val prompt = "List ten common fruits, each with its color and one short fact."
+                                  measured(window) {
+                                      val begin = android.os.SystemClock.elapsedRealtime()
+                                      do {
+                                          checkConditions(sample())
+                                          textInference.call(InferenceProtocol.RESET)
+                                          var profile = ""
+                                          textInference.call(InferenceProtocol.GENERATE, Bundle().apply {
+                                              putString("prompt", prompt)
+                                              putBoolean("thinking", false)
+                                              putInt("maxTokens", 64)
+                                          }) {
+                                              when (it.getString("kind")) {
+                                                  "profile" -> profile = it.getString("text").orEmpty()
+                                                  "memory" -> workerMemory = it.getString("text").orEmpty()
+                                              }
+                                          }
+                                          val generated = Regex("Generated Tokens: ([0-9]+)").find(profile)?.groupValues?.get(1)?.toIntOrNull()
+                                          check(generated != null && generated > 0) { "No valid token count from SDK" }
+                                          tokens += generated
+                                          Regex("Decoding Speed: ([0-9.]+)").find(profile)?.groupValues?.get(1)?.toDoubleOrNull()?.let { speeds.add(it) }
+                                          passes++
+                                      } while (android.os.SystemClock.elapsedRealtime() - begin < 8000 && passes < 40)
+                                  }
+                                  results.append("Round ").append(round + 1).append(" | ").append(label).append(" requested | load ").append(loadMs).append(" ms\\n")
+                                      .append("Requests: ").append(passes).append(" | generated tokens: ").append(tokens)
+                                      .append(" | mean SDK decode tok/s: ").append(if (speeds.isEmpty()) "unavailable" else String.format(Locale.US, "%.2f", speeds.average()))
+                                      .append("\\n").append(window.report(tokens)).append("\\n").append(workerMemory).append("\\n\\n")
+                                  textInference.call(InferenceProtocol.UNLOAD)
+                                  textInference.close()
+                                  kotlinx.coroutines.delay(5000)
+                              }
+                          }
+                      } catch (e: kotlinx.coroutines.CancellationException) {
+                          results.append("Cancelled. Only completed windows are reported.")
+                      } catch (e: Exception) {
+                          results.append("Stopped: ").append(e.message ?: e.javaClass.simpleName)
+                      } finally {
+                          textInference.close()
+                          benchmarkRunning = false
+                          energyBenchmarkJob = null
+                          binding.btnBenchmark.text = "Energy benchmark CPU / GPU / NPU"
+                          spModelList.isEnabled = true
+                          resetLoadState()
+                          if (!isFinishing && !isDestroyed && hasWindowFocus()) {
+                              val report = "Qwen3-0.6B | context 1024 | output cap 64 | whole-device energy estimate | requested devices only\\nLoad excluded; repeated reset/prefill/generation included. No accelerator-only measurement.\\n\\n" + results
+                              AlertDialog.Builder(this@MainActivity).setTitle("Energy benchmark results").setMessage(report)
+                                  .setNeutralButton("Copy") { _, _ ->
+                                      val clipboard = getSystemService(Context.CLIPBOARD_SERVICE) as android.content.ClipboardManager
+                                      clipboard.setPrimaryClip(android.content.ClipData.newPlainText("Tovarish energy benchmark", report))
+                                  }.setPositiveButton("Close", null).show()
+                          }
+                      }
+                  }
+              }
+
+              ''' + s[end:]
+          p.write_text(s)
+          p = Path('src/main/res/layout/activity_main.xml')
+          x = p.read_text()
+          marker = 'android:text="Benchmark CPU / GPU / NPU"'
+          assert x.count(marker) == 1
+          p.write_text(x.replace(marker, 'android:text="Energy benchmark CPU / GPU / NPU"'))
+          p = Path('build.gradle')
+          x = p.read_text()
+          assert x.count('versionCode 4') == 1
+          p.write_text(x.replace('versionCode 4', 'versionCode 5').replace("versionName '1.3-dev'", "versionName '1.4-dev'"))
+          PY
       - name: Build debug APK
         working-directory: upstream/geniex_chat_android
         run: gradle --no-daemon testDebugUnitTest assembleDebug
