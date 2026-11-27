@@ -1207,14 +1207,19 @@ jobs:
                                   binding.btnBenchmark.text = "Cancel " + label + " " + (round + 1) + "/3"
                                   checkConditions(sample())
                                   val startLoad = android.os.SystemClock.elapsedRealtime()
-                                  textInference.call(InferenceProtocol.LOAD, Bundle().apply {
+                                  val loadWindow = EnergyWindow()
+                                  measured(loadWindow) {
+                                      kotlinx.coroutines.withTimeout(30_000) {
+                                          textInference.call(InferenceProtocol.LOAD, Bundle().apply {
                                       putString("model", model.modelName)
                                       putString("runtime", "llama_cpp")
                                       putString("device", device)
                                       putInt("layers", if (label == "CPU") 0 else 999)
                                       putInt("context", 1024)
                                       putBoolean("thinking", false)
-                                  }) { if (it.getString("kind") == "memory") workerMemory = it.getString("text").orEmpty() }
+                                          }) { if (it.getString("kind") == "memory") workerMemory = it.getString("text").orEmpty() }
+                                      }
+                                  }
                                   val loadMs = android.os.SystemClock.elapsedRealtime() - startLoad
                                   val window = EnergyWindow()
                                   var tokens = 0
@@ -1227,6 +1232,7 @@ jobs:
                                           checkConditions(sample())
                                           textInference.call(InferenceProtocol.RESET)
                                           var profile = ""
+                                          kotlinx.coroutines.withTimeout(15_000) {
                                           textInference.call(InferenceProtocol.GENERATE, Bundle().apply {
                                               putString("prompt", prompt)
                                               putBoolean("thinking", false)
@@ -1236,6 +1242,7 @@ jobs:
                                                   "profile" -> profile = it.getString("text").orEmpty()
                                                   "memory" -> workerMemory = it.getString("text").orEmpty()
                                               }
+                                          }
                                           }
                                           val generated = Regex("Generated Tokens: ([0-9]+)").find(profile)?.groupValues?.get(1)?.toIntOrNull()
                                           check(generated != null && generated > 0) { "No valid token count from SDK" }
