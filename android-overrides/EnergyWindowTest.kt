@@ -12,7 +12,7 @@ class EnergyWindowTest {
         assertTrue(w.usable)
         assertEquals(10.0, w.estimatedJoules!!, 1e-9)
         assertEquals(2.5, w.averageWatts!!, 1e-9)
-        assertTrue(w.report(20).contains("gross J/token: 0.500"))
+        assertTrue(w.report(20).contains("estimated gross J/token: unavailable"))
     }
 
     @Test fun missingSamplesAreNotZeroPower() {
@@ -50,5 +50,18 @@ class EnergyWindowTest {
         w.add(sample(8000, null).copy(chargeUah = 9000, energyNwh = 36000000, voltageMv = 4000, discharging = true))
         assertNull(w.estimatedJoules)
         assertTrue(w.report().contains("energy J 14.400 | charge x voltage J 14.400"))
+    }
+    @Test fun unitInferenceRequiresCounterAndChangingCurrent() {
+        assertEquals(1000.0, inferCurrentScale(0.1, 100.0, 8000, 3)!!, 0.0)
+        assertEquals(1.0, inferCurrentScale(100.0, 100.0, 8000, 3)!!, 0.0)
+        assertNull(inferCurrentScale(0.1, 100.0, 2000, 3))
+        assertNull(inferCurrentScale(0.1, 100.0, 8000, 0))
+        assertNull(inferCurrentScale(0.1, 10.0, 8000, 3))
+    }
+    @Test fun calibratedPowerRequiresFreshSamples() {
+        val w = EnergyWindow()
+        for (i in 0..8) w.add(sample(i * 500L, 0.0025).copy(
+            currentUa = 600 + i, discharging = true))
+        assertTrue(w.report(20, 1000.0).contains("estimated gross J/token: 0.500"))
     }
 }
