@@ -74,7 +74,9 @@ internal object QairtArchiveDownloader {
         val assets = release.getJSONArray("assets")
         val matches = (0 until assets.length()).map { assets.getJSONObject(it) }.filter {
             it.optString("chipset") == canonical &&
-                it.optString("runtime") in setOf("RUNTIME_GENIEX_QAIRT", "RUNTIME_GENIE")
+                (if (model.id in setOf("Qwen3-0.6B", "Qwen3-1.7B"))
+                    it.optString("runtime") == "RUNTIME_GENIEX_QAIRT"
+                else it.optString("runtime") in setOf("RUNTIME_GENIEX_QAIRT", "RUNTIME_GENIE"))
         }.sortedWith(compareBy<JSONObject> { if (it.optString("runtime") == "RUNTIME_GENIEX_QAIRT") 0 else 1 }
             .thenBy { it.optString("precision") })
         val asset = matches.firstOrNull() ?: error("No QAIRT archive published for " + chip)
