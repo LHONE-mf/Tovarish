@@ -1200,6 +1200,7 @@ jobs:
                           requestedBackend = "Energy benchmark: idle baseline"
                           measured(baseline) { kotlinx.coroutines.delay(6000) }
                           results.append("Idle baseline:\\n").append(baseline.report()).append("\\n\\n")
+                          check(baseline.usable) { "No reliable instantaneous battery power samples. Send raw diagnostic report; skipping repeated load." }
                           for (round in 0..2) {
                               for (index in 0..2) {
                                   val (label, device) = choices[(round + index) % 3]
@@ -1293,7 +1294,7 @@ jobs:
           p = Path('build.gradle')
           x = p.read_text()
           assert x.count('versionCode 4') == 1
-          p.write_text(x.replace('versionCode 4', 'versionCode 5').replace("versionName '1.3-dev'", "versionName '1.4-dev'"))
+          p.write_text(x.replace('versionCode 4', 'versionCode 6').replace("versionName '1.3-dev'", "versionName '1.4.1-dev'"))
           PY
       - name: Build debug APK
         working-directory: upstream/geniex_chat_android
