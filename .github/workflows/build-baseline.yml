@@ -1153,7 +1153,7 @@ jobs:
                   if (benchmarkRunning) energyBenchmarkJob?.cancel() else offerBenchmark()
               }''')
           replace('override fun onStop() {', 'override fun onStop() {\n        energyBenchmarkJob?.cancel()')
-          replace('Three sequential runs of the same short prompt, context 1024, up to 64 output tokens. Actual hardware placement is unverified. Stops on error or low available RAM. Keep app open.', 'Three rounds, rotating CPU/GPU/NPU order; short repeated requests, context 1024, output cap 64. Measures whole-phone battery power, not accelerator power. Disconnect charger and keep brightness unchanged. Stops on low RAM, thermal stress or leaving app. Tap benchmark button to cancel.')
+          replace('Three sequential runs of the same short prompt, context 1024, up to 64 output tokens. Actual hardware placement is unverified. Stops on error or low available RAM. Keep app open.', '60-second idle sensor calibration, then three rounds rotating CPU/GPU/NPU; short requests, context 1024, output cap 64. Measures whole-phone battery power, not accelerator power. Disconnect charger and keep brightness unchanged. Stops on low RAM, thermal stress or leaving app. Tap benchmark button to cancel.')
           start = s.index('private fun runBackendBenchmark(model: ModelData) {')
           end = s.index('private fun resetLoadState()', start)
           s = s[:start] + '''private fun runBackendBenchmark(model: ModelData) {
@@ -1198,9 +1198,10 @@ jobs:
                           check(kotlinx.coroutines.withContext(Dispatchers.IO) { isModelDownloaded(model) }) { "Download the model first." }
                           val baseline = EnergyWindow()
                           requestedBackend = "Energy benchmark: idle baseline"
-                          measured(baseline) { kotlinx.coroutines.delay(6000) }
-                          results.append("Idle baseline:\\n").append(baseline.report()).append("\\n\\n")
-                          check(baseline.usable) { "No reliable instantaneous battery power samples. Send raw diagnostic report; skipping repeated load." }
+                          measured(baseline) { kotlinx.coroutines.delay(60000) }
+                          val currentScale = baseline.inferredScale()
+                          results.append("60-second idle calibration:\\n").append(baseline.report(scale = currentScale)).append("\\n\\n")
+                          check(currentScale != null) { "Current units not corroborated by charge counter; send diagnostic report. Skipping repeated load." }
                           for (round in 0..2) {
                               for (index in 0..2) {
                                   val (label, device) = choices[(round + index) % 3]
@@ -1255,7 +1256,7 @@ jobs:
                                   results.append("Round ").append(round + 1).append(" | ").append(label).append(" requested | load ").append(loadMs).append(" ms\\n")
                                       .append("Requests: ").append(passes).append(" | generated tokens: ").append(tokens)
                                       .append(" | mean SDK decode tok/s: ").append(if (speeds.isEmpty()) "unavailable" else String.format(Locale.US, "%.2f", speeds.average()))
-                                      .append("\\n").append(window.report(tokens)).append("\\n").append(workerMemory).append("\\n\\n")
+                                      .append("\\n").append(window.report(tokens, currentScale)).append("\\n").append(workerMemory).append("\\n\\n")
                                   textInference.call(InferenceProtocol.UNLOAD)
                                   textInference.close()
                                   kotlinx.coroutines.delay(5000)
@@ -1294,7 +1295,7 @@ jobs:
           p = Path('build.gradle')
           x = p.read_text()
           assert x.count('versionCode 4') == 1
-          p.write_text(x.replace('versionCode 4', 'versionCode 6').replace("versionName '1.3-dev'", "versionName '1.4.1-dev'"))
+          p.write_text(x.replace('versionCode 4', 'versionCode 7').replace("versionName '1.3-dev'", "versionName '1.4.2-dev'"))
           PY
       - name: Build debug APK
         working-directory: upstream/geniex_chat_android
