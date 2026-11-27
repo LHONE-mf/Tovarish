@@ -1297,6 +1297,200 @@ jobs:
           assert x.count('versionCode 4') == 1
           p.write_text(x.replace('versionCode 4', 'versionCode 7').replace("versionName '1.3-dev'", "versionName '1.4.2-dev'"))
           PY
+      - name: Expand text benchmark and add persistent results
+        working-directory: upstream/geniex_chat_android
+        run: |
+          cp ../../tovarish/android-overrides/BenchmarkHistory.kt src/main/java/com/geniex/demo/
+          python - <<'PY'
+          from pathlib import Path
+          import json
+          p = Path('src/main/assets/model_list.json')
+          models = json.loads(p.read_text())
+          for name in ('Qwen3-0.6B', 'Qwen3-1.7B'):
+              assert all(m['id'] != name for m in models)
+              models.append(dict(id=name, displayName=name+' (QAIRT, NPU)', modelName='ai-hub-models/'+name,
+                                 aiHubDisplayName=name, hub='AUTO', type='chat', runtime='qairt', chipset='SM8750'))
+          p.write_text(json.dumps(models, indent=2))
+          p = Path('src/main/java/com/geniex/demo/MainActivity.kt')
+          s = p.read_text()
+          def replace(old, new):
+              global s
+              assert s.count(old) == 1, old
+              s = s.replace(old, new)
+          replace('if (model?.id != "Qwen3-0.6B-GGUF") {', 'if (model == null || model.type !in setOf("chat", "llm") || model.runtime !in setOf("llama_cpp", "qairt")) {')
+          replace('Select the tested Qwen3-0.6B GGUF first.', 'Select a supported text model. Vision models are not benchmarked yet.')
+          start = s.index('AlertDialog.Builder(this)', s.index('private fun offerBenchmark()'))
+          end = s.index('private fun runBackendBenchmark', start)
+          s = s[:start] + '''val options = if (model.runtime == "qairt") listOf("NPU") else listOf("CPU", "GPU", "NPU")
+                  val checked = BooleanArray(options.size) { true }
+                  val energy = android.widget.CheckBox(this).apply {
+                      text = "Attempt optional 60-second battery calibration"
+                      isChecked = false
+                      setPadding(24, 8, 24, 8)
+                  }
+                  AlertDialog.Builder(this)
+                      .setTitle("Benchmark " + model.displayName)
+                      .setMultiChoiceItems(options.toTypedArray(), checked) { _, index, value -> checked[index] = value }
+                      .setView(energy)
+                      .setNegativeButton("Cancel", null)
+                      .setPositiveButton("Run") { _, _ ->
+                          val selected = options.filterIndexed { index, _ -> checked[index] }
+                          if (selected.isNotEmpty()) runBackendBenchmark(model, selected, energy.isChecked)
+                      }.show()
+              }
+
+              ''' + s[end:]
+          replace('private fun runBackendBenchmark(model: ModelData) {', 'private fun runBackendBenchmark(model: ModelData, selected: List<String>, energyEnabled: Boolean) {')
+          replace('val choices = listOf("CPU" to ComputeUnitValue.CPU.value, "GPU" to ComputeUnitValue.GPU.value, "NPU" to ComputeUnitValue.NPU.value)', '''val choices = listOf("CPU" to ComputeUnitValue.CPU.value, "GPU" to ComputeUnitValue.GPU.value, "NPU" to ComputeUnitValue.NPU.value).filter { it.first in selected }
+                      val native = model.runtime == "qairt"
+                      val rows = org.json.JSONArray()
+                      val timestamp = System.currentTimeMillis()
+                      val prefs = getSharedPreferences("native_load", MODE_PRIVATE)
+                      var nativePending = false''')
+          replace('check(!mem.lowMemory && mem.availMem >= 2L * 1073741824L) { "Insufficient available RAM" }', '''check(!mem.lowMemory && mem.availMem >= (if (native) 5L else 2L) * 1073741824L) { "Insufficient available RAM (conservative preflight)" }''')
+          start = s.index('val baseline = EnergyWindow()', s.index('private fun runBackendBenchmark'))
+          end = s.index('requestedBackend = "Energy benchmark " ', start)
+          s = s[:start] + '''var currentScale: Double? = null
+                          if (energyEnabled) {
+                              val baseline = EnergyWindow()
+                              requestedBackend = "Energy benchmark: idle baseline"
+                              measured(baseline) { kotlinx.coroutines.delay(60000) }
+                              currentScale = baseline.inferredScale()
+                              results.append("60-second idle calibration:\\n").append(baseline.report(scale = currentScale)).append("\\n\\n")
+                              if (currentScale == null) results.append("Energy unavailable; performance test continues.\\n\\n")
+                          }
+                          if (native) {
+                              check(model.chipset == android.os.Build.SOC_MODEL.trim().uppercase(Locale.US)) { "Chipset mismatch" }
+                              check(prefs.getString("pending_id", null) == null) { "Previous native load interrupted; diagnosis required" }
+                              val paths = kotlinx.coroutines.withContext(Dispatchers.IO) { ModelManagerWrapper.getPaths(model.modelName) }
+                                  ?: error("Model not downloaded")
+                              check(paths.runtime_id == "qairt") { "Unexpected runtime in cache" }
+                              val file = File(paths.model_path)
+                              val dir = if (file.isDirectory) file else file.parentFile
+                              val weights = dir?.listFiles()?.filter { it.isFile && it.name.endsWith(".bin", true) }?.sumOf { it.length() } ?: 0L
+                              val mem = android.app.ActivityManager.MemoryInfo()
+                              manager.getMemoryInfo(mem)
+                              val minimum = maxOf(5L * 1073741824L, weights + 1610612736L, mem.threshold + 1073741824L)
+                              check(mem.availMem >= minimum && !mem.lowMemory) { "QAIRT RAM preflight blocked: available " + (mem.availMem / 1048576) + " MiB; required " + (minimum / 1048576) + " MiB (provisional)" }
+                          }
+                          for (round in 0..2) {
+                              for (index in choices.indices) {
+                                  val (label, device) = choices[(round + index) % choices.size]
+                                  ''' + s[end:]
+          # Escape Kotlin newlines introduced by Python triple quoted strings.
+          # Native load marker uses the existing preferences; clear only after successful unload.
+          marker = 'val startLoad = android.os.SystemClock.elapsedRealtime()'
+          replace(marker, '''if (native) {
+                                      check(prefs.edit().putString("pending_id", model.id)
+                                          .putString("pending", model.displayName + " | benchmark | " + java.util.Date()).commit())
+                                      nativePending = true
+                                  }
+                                  ''' + marker)
+          start = s.index('private fun runBackendBenchmark')
+          end = s.index('private fun resetLoadState()', start)
+          b = s[start:end]
+          assert b.count('putString("runtime", "llama_cpp")') == 1
+          b = b.replace('putString("runtime", "llama_cpp")', 'putString("runtime", model.runtime ?: "llama_cpp")')
+          b = b.replace('putInt("context", 1024)', 'putInt("context", if (native) 0 else 1024)')
+          b = b.replace('putInt("layers", if (label == "CPU") 0 else 999)', 'putInt("layers", if (native || label == "CPU") 0 else 999)')
+          b = b.replace('kotlinx.coroutines.withTimeout(30_000)', 'kotlinx.coroutines.withTimeout(60_000)')
+          b = b.replace('kotlinx.coroutines.withTimeout(15_000)', 'kotlinx.coroutines.withTimeout(30_000)')
+          marker = 'textInference.call(InferenceProtocol.UNLOAD)'
+          assert b.count(marker) == 1
+          b = b.replace(marker, '''rows.put(org.json.JSONObject().apply {
+                                      put("round", round + 1)
+                                      put("device", label)
+                                      put("load_ms", loadMs)
+                                      put("tokens", tokens)
+                                      put("seconds", window.seconds)
+                                      if (speeds.isNotEmpty()) put("decode", speeds.average())
+                                      Regex("Worker PSS ([0-9]+)").find(workerMemory)?.groupValues?.get(1)?.toLongOrNull()?.let { put("pss", it) }
+                                      put("memory_report", workerMemory)
+                                      put("energy_report", window.report(tokens, currentScale))
+                                  })
+                                  textInference.call(InferenceProtocol.UNLOAD)
+                                  if (nativePending) {
+                                      check(prefs.edit().remove("pending_id").remove("pending").commit())
+                                      nativePending = false
+                                  }''')
+          # Move report persistence outside the visibility check, including partial runs.
+          old = 'if (!isFinishing && !isDestroyed && hasWindowFocus()) {'
+          assert b.count(old) == 1
+          pos = b.index(old)
+          report_start = b.index('val report = ', pos)
+          report_end = b.index('\n', report_start)
+          b = b[:pos] + '''val report = model.displayName + " | runtime " + model.runtime +
+                                  " | context " + (if (native) "compiled" else "1024") +
+                                  " | output cap 64 | requested devices only\\\\nLoad excluded from generation window.\\\\n\\\\n" + results
+                              val saved = runCatching {
+                                  BenchmarkHistory(this@MainActivity).save(org.json.JSONObject().apply {
+                                      put("timestamp", timestamp)
+                                      put("model", model.id)
+                                      put("runtime", model.runtime)
+                                      put("quant", model.quant ?: "bundle-selected")
+                                      put("context", if (native) "compiled" else "1024")
+                                      put("sdk", "0.3.5")
+                                      put("protocol", "1.5-repeated-64")
+                                      put("soc", android.os.Build.SOC_MODEL)
+                                      put("runs", rows)
+                                      put("report", report)
+                                  })
+                              }.isSuccess
+                              if (!isFinishing && !isDestroyed && hasWindowFocus()) {
+                                  val displayReport = report + if (saved) "\\\\nSaved to local history." else "\\\\nHistory save failed."
+                              ''' + b[report_end:]
+          b = b.replace('.setMessage(report)', '.setMessage(displayReport)').replace('newPlainText("Tovarish energy benchmark", report)', 'newPlainText("Tovarish benchmark", displayReport)')
+          # These three lines were authored in the earlier replacement using Python escapes.
+          b = b.replace('calibration:\n").append', 'calibration:\\n").append').replace('.append("\n\n")', '.append("\\n\\n")').replace('continues.\n\n")', 'continues.\\n\\n")')
+          s = s[:start] + b + s[end:]
+          replace('binding.btnBenchmark.text = "Energy benchmark CPU / GPU / NPU"', 'binding.btnBenchmark.text = "Benchmark selected model"')
+          replace('binding.btnBenchmark.setOnClickListener {', '''binding.btnBenchmarkHistory.setOnClickListener { showBenchmarkHistory() }
+                  binding.btnBenchmark.setOnClickListener {''')
+          replace('private fun offerBenchmark() {', '''private fun showBenchmarkHistory() {
+                  if (benchmarkRunning) return
+                  val history = BenchmarkHistory(this)
+                  val records = history.records()
+                  if (records.isEmpty()) {
+                      Toast.makeText(this, "No saved benchmarks yet.", Toast.LENGTH_SHORT).show()
+                      return
+                  }
+                  val labels = listOf("Compare latest configurations") + records.map {
+                      it.optString("model") + " | " + java.util.Date(it.optLong("timestamp"))
+                  }
+                  AlertDialog.Builder(this).setTitle("Benchmark history").setItems(labels.toTypedArray()) { _, index ->
+                      val report = if (index == 0) history.comparison(records) else records[index-1].optString("report")
+                      AlertDialog.Builder(this).setTitle(labels[index]).setMessage(report)
+                          .setNeutralButton("Copy") { _, _ ->
+                              val clipboard = getSystemService(Context.CLIPBOARD_SERVICE) as android.content.ClipboardManager
+                              clipboard.setPrimaryClip(android.content.ClipData.newPlainText("Benchmark", report))
+                          }.setPositiveButton("Close", null).show()
+                  }.show()
+              }
+
+              private fun offerBenchmark() {''')
+          p.write_text(s)
+          p = Path('src/main/res/layout/activity_main.xml')
+          x = p.read_text()
+          marker = 'android:text="Energy benchmark CPU / GPU / NPU"'
+          assert x.count(marker) == 1
+          x = x.replace(marker, 'android:text="Benchmark selected model"')
+          marker = '        <!-- Control buttons section -->'
+          assert x.count(marker) == 1
+          p.write_text(x.replace(marker, '''        <Button
+                      android:id="@+id/btn_benchmark_history"
+                      android:layout_width="match_parent"
+                      android:layout_height="wrap_content"
+                      android:text="Benchmark history"
+                      android:textAllCaps="false"
+                      android:textColor="#F2F2F3"
+                      android:backgroundTint="#242424" />
+
+          ''' + marker))
+          p = Path('build.gradle')
+          x = p.read_text()
+          assert x.count('versionCode 7') == 1
+          p.write_text(x.replace('versionCode 7', 'versionCode 8').replace("versionName '1.4.2-dev'", "versionName '1.5-dev'"))
+          PY
       - name: Build debug APK
         working-directory: upstream/geniex_chat_android
         run: gradle --no-daemon testDebugUnitTest assembleDebug
